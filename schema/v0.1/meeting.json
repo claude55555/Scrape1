@@ -1,0 +1,452 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schema.opencivicagenda.org/v0.1/meeting.json",
+  "title": "Open Civic Agenda - Meeting",
+  "description": "A schema for municipal meeting agendas, minutes, and related records. Designed for flat-file storage, backup, migration, and interchange between systems. Uses OCD-style identifiers and Popolo-compatible field names where applicable. Files are fully self-contained — no external references need to be resolved to understand or import a record.",
+  "type": "object",
+  "required": ["id", "name", "organization", "start_date"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Primary identifier for this meeting. OCD format recommended: ocd-event/{uuid}. See spec guidance on identifier conventions.",
+      "examples": ["ocd-event/a1b2c3d4-5678-9abc-def0-123456789abc"]
+    },
+    "identifiers": {
+      "$ref": "#/$defs/identifiers",
+      "description": "Alternate identifiers for this meeting in other systems (Legistar event IDs, Granicus clip IDs, etc.)."
+    },
+    "name": {
+      "type": "string",
+      "description": "Human-readable title of the meeting.",
+      "examples": ["Regular City Council Meeting", "Planning Commission Special Session"]
+    },
+    "organization": {
+      "description": "The body holding the meeting. Can be a simple name string or a structured object. Structured form with a stable identifier is RECOMMENDED for interchange.",
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "required": ["name"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "description": "Stable identifier. Deterministic path format recommended: {jurisdiction-id}/body/{slug}",
+              "examples": [
+                "ocd-jurisdiction/country:us/state:co/place:millfield/government/body/city-council",
+                "ocd-organization/a1b2c3d4-5678-9abc-def0-123456789abc"
+              ]
+            },
+            "name": { "type": "string" },
+            "classification": {
+              "type": "string",
+              "examples": ["legislature", "commission", "board", "committee", "subcommittee"]
+            },
+            "identifiers": { "$ref": "#/$defs/identifiers" }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "jurisdiction": {
+      "description": "The governing jurisdiction. Structured form with OCD jurisdiction path is RECOMMENDED for interchange.",
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "required": ["name"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "description": "OCD jurisdiction path. This format is deterministic — any producer can generate the same ID independently.",
+              "examples": ["ocd-jurisdiction/country:us/state:co/place:millfield/government"]
+            },
+            "name": { "type": "string" },
+            "url": { "type": "string", "format": "uri" },
+            "identifiers": {
+              "$ref": "#/$defs/identifiers",
+              "description": "Alternate identifiers — FIPS codes, Census GEOIDs, etc."
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "start_date": {
+      "type": "string",
+      "description": "When the meeting is scheduled to begin. ISO 8601 datetime with timezone, or date-only if time is unknown.",
+      "examples": ["2025-03-15T18:00:00-07:00", "2025-03-15"]
+    },
+    "end_date": {
+      "type": "string",
+      "description": "When the meeting ended or is expected to end. Same format as start_date."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["scheduled", "in_progress", "completed", "cancelled", "continued"],
+      "description": "'continued' indicates the meeting was adjourned and will resume at a later date."
+    },
+    "location": {
+      "type": "object",
+      "description": "Where the meeting takes place. All fields optional to handle virtual, hybrid, and TBD situations.",
+      "properties": {
+        "name": { "type": "string", "examples": ["City Hall Council Chambers"] },
+        "address": { "type": "string" },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Virtual meeting link (Zoom, etc.) or venue webpage."
+        },
+        "coordinates": {
+          "type": "object",
+          "properties": {
+            "latitude": { "type": "number" },
+            "longitude": { "type": "number" }
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "agenda_items": {
+      "type": "array",
+      "description": "The ordered list of agenda items. Items can nest arbitrarily via the 'items' field.",
+      "items": { "$ref": "#/$defs/agenda_item" }
+    },
+    "participants": {
+      "type": "array",
+      "description": "People involved in the meeting (members, staff, presenters, public speakers).",
+      "items": { "$ref": "#/$defs/person_ref" }
+    },
+    "documents": {
+      "type": "array",
+      "description": "Meeting-level documents (the full agenda PDF, minutes, meeting packet, etc.).",
+      "items": { "$ref": "#/$defs/document" }
+    },
+    "media": {
+      "type": "array",
+      "description": "Audio/video recordings of the meeting. Each item can be referenced from agenda items via 'media_ref'. For meetings with a single recording, a one-element array is fine.",
+      "items": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Local identifier for referencing this media from agenda items. Only needs to be unique within this file. Defaults to array index if omitted.",
+            "examples": ["video-main", "audio-chambers"]
+          },
+          "url": { "type": "string", "format": "uri" },
+          "type": {
+            "type": "string",
+            "examples": ["video", "audio", "livestream"]
+          },
+          "media_type": {
+            "type": "string",
+            "description": "MIME type if known.",
+            "examples": ["video/mp4", "audio/mpeg"]
+          },
+          "duration_seconds": {
+            "type": "integer",
+            "description": "Total duration of the recording in seconds, if known."
+          },
+          "label": {
+            "type": "string",
+            "description": "Human-readable label to distinguish multiple recordings.",
+            "examples": ["Official YouTube recording", "Audio-only backup"]
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "related_meetings": {
+      "type": "array",
+      "description": "References to other meetings related to this one — joint sessions, continued meetings, breakout sessions, etc. Concurrent sessions (breakout rooms, parallel committee hearings) should be modeled as separate meeting files that reference each other here.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Primary identifier of the related meeting."
+          },
+          "identifiers": { "$ref": "#/$defs/identifiers" },
+          "name": { "type": "string" },
+          "relation": {
+            "type": "string",
+            "examples": ["continued_from", "continued_to", "joint_session_with", "breakout_of", "parent_session"]
+          },
+          "start_date": {
+            "type": "string",
+            "description": "Start date of the related meeting, for context without needing to resolve the reference."
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "sources": {
+      "type": "array",
+      "description": "Where this data came from. Important for scraped/aggregated data.",
+      "items": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+          "url": { "type": "string", "format": "uri" },
+          "note": { "type": "string" },
+          "retrieved_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "extras": {
+      "type": "object",
+      "description": "Grab bag for jurisdiction-specific or experimental fields. Use this rather than polluting the top level.",
+      "additionalProperties": true
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this record was last modified."
+    },
+    "schema_version": {
+      "type": "string",
+      "description": "Version of this schema the document conforms to.",
+      "examples": ["0.1"]
+    }
+  },
+  "additionalProperties": true,
+
+  "$defs": {
+    "identifiers": {
+      "type": "array",
+      "description": "Alternate identifiers for this entity in other systems. Enables cross-system matching without requiring a single canonical ID authority. The 'scheme' field is a namespace (use lowercase slugs, colon-scoped for system-specific schemes like 'legistar:millfield'). The 'identifier' field is the value within that namespace.",
+      "items": {
+        "type": "object",
+        "required": ["scheme", "identifier"],
+        "properties": {
+          "scheme": {
+            "type": "string",
+            "description": "Namespace or system that issued this identifier. Use consistent lowercase slugs. Scoped schemes use colon separators.",
+            "examples": [
+              "legistar:millfield",
+              "granicus",
+              "open_states",
+              "votesmart",
+              "ballotpedia",
+              "fips",
+              "census_geoid",
+              "fivemountains"
+            ]
+          },
+          "identifier": {
+            "type": "string",
+            "description": "The identifier value within the given scheme."
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+
+    "person_ref": {
+      "type": "object",
+      "description": "A reference to a person. Fully denormalized — includes all information needed to understand who this is without resolving external references. Identifiers enable cross-system matching on import.",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "id": {
+          "type": "string",
+          "description": "Primary identifier. OCD person ID if available."
+        },
+        "identifiers": { "$ref": "#/$defs/identifiers" },
+        "role": {
+          "type": "string",
+          "examples": ["chair", "vice_chair", "member", "clerk", "attorney", "manager", "presenter", "public_commenter"]
+        },
+        "present": {
+          "type": "boolean",
+          "description": "Whether this person attended. Null/absent if unknown."
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "agenda_item": {
+      "type": "object",
+      "required": ["title"],
+      "description": "A single agenda item. Can nest via 'items' for sub-items (consent calendar entries, subsections, etc.).",
+      "properties": {
+        "order": {
+          "description": "Position in the agenda. String to allow '4.a.ii' style numbering as published.",
+          "oneOf": [
+            { "type": "integer" },
+            { "type": "string" }
+          ]
+        },
+        "title": {
+          "type": "string",
+          "description": "The agenda item title as it appears on the published agenda."
+        },
+        "description": {
+          "type": "string",
+          "description": "Longer description or staff summary if available."
+        },
+        "classification": {
+          "type": "string",
+          "description": "What kind of agenda item this is.",
+          "examples": [
+            "consent", "action", "public_hearing",
+            "presentation", "discussion", "ceremonial", "closed_session",
+            "call_to_order", "roll_call", "adjournment", "public_comment",
+            "informational"
+          ]
+        },
+        "items": {
+          "type": "array",
+          "description": "Nested sub-items. Same structure, recursive.",
+          "items": { "$ref": "#/$defs/agenda_item" }
+        },
+        "result": {
+          "description": "Outcome of this item, if any. Added after the meeting or during minutes creation.",
+          "$ref": "#/$defs/result"
+        },
+        "documents": {
+          "type": "array",
+          "description": "Staff reports, attachments, proposed ordinances, etc. specific to this item.",
+          "items": { "$ref": "#/$defs/document" }
+        },
+        "speakers": {
+          "type": "array",
+          "description": "People who spoke on this item (public commenters, presenters).",
+          "items": { "$ref": "#/$defs/person_ref" }
+        },
+        "related_items": {
+          "type": "array",
+          "description": "References to legislation, ordinances, resolutions, or other agenda items.",
+          "items": { "$ref": "#/$defs/related_item_ref" }
+        },
+        "media_ref": {
+          "type": "object",
+          "description": "Links this agenda item to a point or span in a meeting recording. Enables deep-linking into video/audio.",
+          "properties": {
+            "media_id": {
+              "type": "string",
+              "description": "The 'id' of the media item in the meeting's media array. If omitted, refers to the first media item."
+            },
+            "offset_seconds": {
+              "type": "integer",
+              "description": "Start point in the recording, in seconds from the beginning."
+            },
+            "end_offset_seconds": {
+              "type": "integer",
+              "description": "End point in the recording, if a span is known."
+            }
+          },
+          "additionalProperties": true
+        },
+        "extras": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "result": {
+      "type": "object",
+      "description": "The outcome of an agenda item — a vote, a decision to table, etc.",
+      "properties": {
+        "status": {
+          "type": "string",
+          "examples": ["passed", "failed", "tabled", "withdrawn", "continued", "received_and_filed", "no_action"]
+        },
+        "vote_type": {
+          "type": "string",
+          "examples": ["roll_call", "voice", "unanimous_consent", "show_of_hands"]
+        },
+        "counts": {
+          "type": "object",
+          "description": "Vote tallies. Keys are the option names.",
+          "examples": [{ "yes": 5, "no": 2, "abstain": 1 }],
+          "additionalProperties": { "type": "integer" }
+        },
+        "votes": {
+          "type": "array",
+          "description": "Individual votes for roll call votes.",
+          "items": {
+            "type": "object",
+            "required": ["voter", "option"],
+            "properties": {
+              "voter": { "type": "string" },
+              "voter_id": {
+                "type": "string",
+                "description": "Primary identifier for the voter."
+              },
+              "voter_identifiers": {
+                "$ref": "#/$defs/identifiers",
+                "description": "Alternate identifiers for the voter."
+              },
+              "option": {
+                "type": "string",
+                "examples": ["yes", "no", "abstain", "absent", "not_voting"]
+              },
+              "note": { "type": "string" }
+            },
+            "additionalProperties": true
+          }
+        },
+        "motion_by": { "type": "string" },
+        "second_by": { "type": "string" },
+        "note": {
+          "type": "string",
+          "description": "Any additional context — 'Item was tabled to April 5 meeting', etc."
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "related_item_ref": {
+      "type": "object",
+      "description": "A reference to legislation, an ordinance, resolution, or another meeting/agenda item.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Primary identifier. OCD bill ID if available."
+        },
+        "identifiers": { "$ref": "#/$defs/identifiers" },
+        "identifier": {
+          "type": "string",
+          "description": "Human-readable number as used by the jurisdiction.",
+          "examples": ["Ordinance 2025-042", "Resolution 12-A", "ZC-2025-003"]
+        },
+        "title": {
+          "type": "string",
+          "description": "Title of the related item if known."
+        },
+        "relation": {
+          "type": "string",
+          "examples": ["introduces", "amends", "continues_from", "supersedes", "references"]
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "document": {
+      "type": "object",
+      "description": "An attached or related document. At minimum, include a title. URL may be unavailable for documents that are behind auth, not yet published, or where the link has gone dead.",
+      "required": ["title"],
+      "properties": {
+        "title": { "type": "string" },
+        "url": { "type": "string", "format": "uri" },
+        "media_type": {
+          "type": "string",
+          "examples": ["application/pdf", "text/html"]
+        },
+        "type": {
+          "type": "string",
+          "description": "What role this document plays.",
+          "examples": ["agenda", "minutes", "staff_report", "ordinance", "resolution", "attachment", "packet"]
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

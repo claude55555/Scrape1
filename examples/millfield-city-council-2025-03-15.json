@@ -1,0 +1,213 @@
+{
+  "id": "ocd-event/f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "name": "Regular City Council Meeting",
+  "schema_version": "0.1",
+  "organization": {
+    "id": "ocd-jurisdiction/country:us/state:co/place:millfield/government/body/city-council",
+    "name": "Millfield City Council",
+    "classification": "legislature"
+  },
+  "jurisdiction": {
+    "id": "ocd-jurisdiction/country:us/state:co/place:millfield/government",
+    "name": "City of Millfield",
+    "url": "https://www.millfield.gov",
+    "identifiers": [
+      { "scheme": "fips", "identifier": "08999" }
+    ]
+  },
+  "start_date": "2025-03-15T18:00:00-07:00",
+  "end_date": "2025-03-15T20:45:00-07:00",
+  "status": "completed",
+  "location": {
+    "name": "City Hall Council Chambers",
+    "address": "100 Main Street, Millfield, CO 80000",
+    "url": "https://www.millfield.gov/meetings/live",
+    "coordinates": {
+      "latitude": 39.7392,
+      "longitude": -104.9903
+    }
+  },
+  "participants": [
+    { "name": "Sarah Chen", "role": "chair", "present": true },
+    { "name": "Marcus Johnson", "role": "vice_chair", "present": true },
+    { "name": "Lisa Patel", "role": "member", "present": true },
+    { "name": "Robert Kim", "role": "member", "present": true },
+    { "name": "Diana Torres", "role": "member", "present": false },
+    { "name": "James Wright", "role": "member", "present": true },
+    { "name": "Amy Nguyen", "role": "member", "present": true },
+    { "name": "Patricia Holmes", "role": "clerk", "present": true },
+    { "name": "David Marshall", "role": "attorney", "present": true }
+  ],
+  "agenda_items": [
+    {
+      "order": "1",
+      "title": "Call to Order",
+      "classification": "call_to_order",
+      "media_ref": { "media_id": "video-main", "offset_seconds": 0 }
+    },
+    {
+      "order": "2",
+      "title": "Roll Call",
+      "classification": "roll_call",
+      "media_ref": { "media_id": "video-main", "offset_seconds": 45 }
+    },
+    {
+      "order": "3",
+      "title": "Consent Calendar",
+      "classification": "consent",
+      "description": "Items considered routine and enacted in one motion unless pulled for separate discussion.",
+      "result": {
+        "status": "passed",
+        "vote_type": "voice",
+        "motion_by": "Marcus Johnson",
+        "second_by": "Lisa Patel"
+      },
+      "items": [
+        {
+          "order": "3.a",
+          "title": "Approval of Minutes - March 1, 2025 Regular Meeting",
+          "documents": [
+            {
+              "title": "Draft Minutes - March 1, 2025",
+              "url": "https://www.millfield.gov/documents/minutes-2025-03-01.pdf",
+              "media_type": "application/pdf",
+              "type": "minutes"
+            }
+          ]
+        },
+        {
+          "order": "3.b",
+          "title": "Warrant Register - February 2025",
+          "documents": [
+            {
+              "title": "Warrant Register February 2025",
+              "url": "https://www.millfield.gov/documents/warrant-2025-02.pdf",
+              "media_type": "application/pdf",
+              "type": "attachment"
+            }
+          ]
+        }
+      ],
+      "media_ref": { "media_id": "video-main", "offset_seconds": 120 }
+    },
+    {
+      "order": "4",
+      "title": "Public Hearing: Rezoning Application ZC-2025-003",
+      "classification": "public_hearing",
+      "description": "Public hearing on a request to rezone parcel 12-345-67-890 from R-1 (Single Family Residential) to MU-2 (Mixed Use). The applicant proposes a 4-story mixed-use development with ground-floor retail and 48 residential units.",
+      "related_items": [
+        {
+          "identifier": "ZC-2025-003",
+          "title": "Rezoning Application - 500 Oak Avenue",
+          "relation": "introduces"
+        }
+      ],
+      "documents": [
+        {
+          "title": "Staff Report - ZC-2025-003",
+          "url": "https://www.millfield.gov/documents/staff-report-zc-2025-003.pdf",
+          "media_type": "application/pdf",
+          "type": "staff_report"
+        }
+      ],
+      "speakers": [
+        { "name": "Tom Bradley", "role": "presenter" },
+        { "name": "Jennifer Adams", "role": "public_commenter" },
+        { "name": "Mike Sullivan", "role": "public_commenter" }
+      ],
+      "result": {
+        "status": "passed",
+        "vote_type": "roll_call",
+        "counts": { "yes": 5, "no": 1, "absent": 1 },
+        "votes": [
+          { "voter": "Sarah Chen", "option": "yes" },
+          { "voter": "Marcus Johnson", "option": "yes" },
+          { "voter": "Lisa Patel", "option": "no" },
+          { "voter": "Robert Kim", "option": "yes" },
+          { "voter": "Diana Torres", "option": "absent" },
+          { "voter": "James Wright", "option": "yes" },
+          { "voter": "Amy Nguyen", "option": "yes" }
+        ],
+        "motion_by": "Robert Kim",
+        "second_by": "James Wright"
+      },
+      "media_ref": {
+        "media_id": "video-main",
+        "offset_seconds": 900,
+        "end_offset_seconds": 4500
+      }
+    },
+    {
+      "order": "5",
+      "title": "Resolution 2025-12: Supporting State Transportation Funding",
+      "classification": "action",
+      "related_items": [
+        {
+          "identifier": "Resolution 2025-12",
+          "title": "A Resolution Supporting Increased State Transportation Funding for Rural Communities",
+          "relation": "introduces"
+        }
+      ],
+      "result": {
+        "status": "passed",
+        "vote_type": "unanimous_consent",
+        "motion_by": "Amy Nguyen",
+        "second_by": "Marcus Johnson"
+      },
+      "media_ref": { "media_id": "video-main", "offset_seconds": 4500 }
+    },
+    {
+      "order": "6",
+      "title": "City Manager's Report",
+      "classification": "informational",
+      "description": "Updates on Q1 road maintenance, summer recreation program registration, and water treatment facility upgrade timeline.",
+      "media_ref": { "media_id": "video-main", "offset_seconds": 5400 }
+    },
+    {
+      "order": "7",
+      "title": "Public Comment",
+      "classification": "public_comment",
+      "speakers": [
+        { "name": "Carol Stevens", "role": "public_commenter" }
+      ],
+      "media_ref": { "media_id": "video-main", "offset_seconds": 7200 }
+    },
+    {
+      "order": "8",
+      "title": "Adjournment",
+      "classification": "adjournment",
+      "media_ref": { "media_id": "video-main", "offset_seconds": 9900 }
+    }
+  ],
+  "documents": [
+    {
+      "title": "Meeting Agenda - March 15, 2025",
+      "url": "https://www.millfield.gov/documents/agenda-2025-03-15.pdf",
+      "media_type": "application/pdf",
+      "type": "agenda"
+    },
+    {
+      "title": "Meeting Minutes - March 15, 2025",
+      "url": "https://www.millfield.gov/documents/minutes-2025-03-15.pdf",
+      "media_type": "application/pdf",
+      "type": "minutes"
+    }
+  ],
+  "media": [
+    {
+      "id": "video-main",
+      "url": "https://www.youtube.com/watch?v=example123",
+      "type": "video",
+      "label": "Official YouTube recording",
+      "duration_seconds": 9900
+    }
+  ],
+  "sources": [
+    {
+      "url": "https://www.millfield.gov/meetings/2025-03-15",
+      "note": "City of Millfield meeting portal",
+      "retrieved_at": "2025-03-16T10:00:00Z"
+    }
+  ],
+  "updated_at": "2025-03-16T10:00:00Z"
+}

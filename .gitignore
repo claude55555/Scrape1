@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+dist/
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+
+# Scraper output
+output/
