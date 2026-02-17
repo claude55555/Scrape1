@@ -142,6 +142,14 @@ class GranicusScraper(BaseScraper):
 
         super().__init__(output_dir)
 
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (compatible; OpenCivicAgenda/0.1; "
+                "+https://github.com/opencivicagenda)"
+            ),
+        })
+
     def output_filename(self, meeting: dict) -> str:
         """Include clip_id in filenames so meetings never collide."""
         org = meeting.get("organization", {})
@@ -151,14 +159,6 @@ class GranicusScraper(BaseScraper):
         date_str = meeting["start_date"][:10]
         clip_id = self._current_clip_id or "unknown"
         return f"{slug}_{date_str}_clip-{clip_id}.json"
-
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (compatible; OpenCivicAgenda/0.1; "
-                "+https://github.com/opencivicagenda)"
-            ),
-        })
 
     # ------------------------------------------------------------------
     # HTTP helpers
