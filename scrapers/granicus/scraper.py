@@ -68,6 +68,52 @@ class GranicusSite:
     def base_url(self) -> str:
         return f"https://{self.subdomain}.granicus.com"
 
+    @classmethod
+    def from_url(cls, url: str) -> "GranicusSite":
+        """Create a GranicusSite from any Granicus URL.
+
+        Accepts URLs like:
+            https://erie.granicus.com/ViewPublisher.php?view_id=3
+            https://erie.granicus.com/player/clip/1234?view_id=3
+            https://erie.granicus.com/GeneratedAgendaViewer.php?view_id=3&clip_id=456
+            https://erie.granicus.com
+            erie.granicus.com
+
+        Extracts the subdomain and any view_id present. The body name for each
+        view is auto-discovered later when the scraper fetches ViewPublisher.
+        """
+        # Handle bare hostnames without scheme
+        if not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
+
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+
+        # Extract subdomain from {subdomain}.granicus.com
+        m = re.match(r"^(.+)\.granicus\.com$", host, re.I)
+        if not m:
+            raise ValueError(
+                f"Not a Granicus URL: {url}  (expected {{subdomain}}.granicus.com)"
+            )
+        subdomain = m.group(1)
+
+        # Extract view_id from query string if present
+        params = parse_qs(parsed.query)
+        views: dict[int, str] = {}
+        if "view_id" in params:
+            vid = int(params["view_id"][0])
+            views[vid] = ""  # body name discovered later
+
+        # Generate sensible defaults from the subdomain
+        readable = subdomain.replace("-", " ").replace("_", " ").title()
+
+        return cls(
+            subdomain=subdomain,
+            jurisdiction_id=f"ocd-jurisdiction/country:us/custom:{subdomain}/government",
+            jurisdiction_name=readable,
+            views=views,
+        )
+
 
 class GranicusScraper(BaseScraper):
     """Scraper for the classic Granicus meeting platform.
@@ -138,11 +184,88 @@ class GranicusScraper(BaseScraper):
     # Phase 1: List meetings from ViewPublisher.php
     # ------------------------------------------------------------------
 
+    def discover_views(self) -> dict[int, str]:
+        """Auto-discover available views by probing ViewPublisher.php.
+
+        Tries view_id 1..30 and returns a mapping of {view_id: body_name}
+        for any that return valid content. Useful when you only have a
+        subdomain and don't know which view_ids exist.
+        """
+        discovered = {}
+        for vid in range(1, 31):
+            url = self._url("ViewPublisher.php", view_id=vid)
+            try:
+                time.sleep(self.request_delay)
+                resp = self.session.get(url, timeout=15)
+                if resp.status_code != 200:
+                    continue
+                soup = BeautifulSoup(resp.text, "html.parser")
+                name = self._extract_body_name(soup, vid)
+                if name:
+                    discovered[vid] = name
+                    logger.info("  Discovered view %d: %s", vid, name)
+            except requests.RequestException:
+                continue
+        return discovered
+
+    def _extract_body_name(self, soup: BeautifulSoup, view_id: int) -> str | None:
+        """Extract the body/committee name from a ViewPublisher page.
+
+        Returns None if the page looks empty or invalid.
+        """
+        # Check if there's any real content (at least one clip link or event)
+        has_content = (
+            soup.find("a", href=re.compile(r"(player/clip|MediaPlayer|GeneratedAgenda)"))
+            or soup.find(string=re.compile(r"(Upcoming|Archived|Events)", re.I))
+        )
+        if not has_content:
+            return None
+
+        # Try <title> tag — often "City Council - Granicus" or similar
+        title_tag = soup.find("title")
+        if title_tag:
+            text = title_tag.get_text(strip=True)
+            # Strip common suffixes
+            for suffix in [" - Granicus", " | Granicus", " - ViewPublisher"]:
+                if text.endswith(suffix):
+                    text = text[: -len(suffix)].strip()
+            if text and text.lower() not in ("granicus", "viewpublisher", ""):
+                return text
+
+        # Try <h1> or <h2> on the page
+        for tag in soup.find_all(["h1", "h2"]):
+            text = tag.get_text(strip=True)
+            if text and len(text) > 2:
+                return text
+
+        return f"View {view_id}"
+
     def list_meetings(self, start_date=None, end_date=None) -> list[dict]:
         """Scrape ViewPublisher.php for each configured view to get clip listings.
 
         Returns a list of dicts (serialized ClipRefs) for scrape_meeting().
         """
+        # If no views configured, auto-discover
+        if not self.site.views:
+            logger.info("No views configured — discovering available views...")
+            self.site.views = self.discover_views()
+            if not self.site.views:
+                logger.warning("No views found for %s", self.site.subdomain)
+                return []
+            logger.info("Discovered %d view(s)", len(self.site.views))
+
+        # Fill in empty body names by fetching the page title
+        for view_id, body_name in list(self.site.views.items()):
+            if not body_name:
+                url = self._url("ViewPublisher.php", view_id=view_id)
+                try:
+                    soup = self._soup(url)
+                    discovered_name = self._extract_body_name(soup, view_id)
+                    self.site.views[view_id] = discovered_name or f"View {view_id}"
+                    logger.info("View %d: %s", view_id, self.site.views[view_id])
+                except requests.RequestException:
+                    self.site.views[view_id] = f"View {view_id}"
+
         all_refs = []
         for view_id, body_name in self.site.views.items():
             logger.info("Listing meetings for view %d (%s)", view_id, body_name)
