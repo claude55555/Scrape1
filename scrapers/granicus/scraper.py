@@ -38,6 +38,20 @@ logger = logging.getLogger(__name__)
 # Default delay between HTTP requests to be polite
 REQUEST_DELAY = 1.0
 
+# Strict date pattern: requires real month names so we never match durations,
+# agenda-item numbers ("Item 3, 2025"), or other non-date text.
+_MONTH_RE = (
+    r"(?:January|February|March|April|May|June|July|August|September"
+    r"|October|November|December"
+    r"|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+)
+_DATE_RE = re.compile(
+    rf"({_MONTH_RE}\s+\d{{1,2}},\s*\d{{4}}"   # January 15, 2025
+    rf"|\d{{1,2}}/\d{{1,2}}/\d{{2,4}}"          # 1/15/2025 or 1/15/25
+    rf"|\d{{4}}-\d{{2}}-\d{{2}})",               # 2025-01-15
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class ClipRef:
@@ -304,55 +318,100 @@ class GranicusScraper(BaseScraper):
     def _parse_view_publisher(self, view_id: int, body_name: str) -> list[ClipRef]:
         """Parse the ViewPublisher.php page for a single view.
 
-        The page has two sections: "Upcoming Events" and past/archived events.
-        We only care about archived events that have clip recordings.
-
-        The archive table structure is typically:
-            <table>
-              <tr>  (header row)
-              <tr>
-                <td>Date</td>
-                <td>Title/Duration</td>
-                <td><a href="player/clip/123?view_id=5">Video</a></td>
-                <td><a href="GeneratedAgendaViewer.php?...">Agenda</a></td>
-                <td><a href="MinutesViewer.php?...">Minutes</a></td>
-              </tr>
-              ...
-            </table>
+        Iterates table rows top-to-bottom so that date-only header rows
+        (``<tr><td colspan="5">January 15, 2025</td></tr>``) are tracked
+        and applied to the clip rows that follow.  Agenda/minutes URLs
+        are cross-validated against the player link's clip_id so data
+        from different meetings is never mixed into a single record.
         """
         url = self._url("ViewPublisher.php", view_id=view_id)
         soup = self._soup(url)
-        refs = []
 
-        # Find all links to the player — each one represents an archived clip
-        # Pattern: /player/clip/{clip_id} or MediaPlayer.php?clip_id={id}
-        player_links = soup.find_all("a", href=re.compile(r"(player/clip/\d+|MediaPlayer\.php\?.*clip_id=\d+)"))
+        table = self._find_meeting_table(soup)
+        if table is None:
+            return self._parse_view_publisher_divs(soup, view_id, body_name)
 
-        for link in player_links:
-            clip_id = self._extract_clip_id(link["href"])
-            if clip_id is None:
+        player_re = re.compile(
+            r"(player/clip/\d+|MediaPlayer\.php\?.*clip_id=\d+)"
+        )
+
+        refs: list[ClipRef] = []
+        seen_clip_ids: set[int] = set()
+        current_date = ""
+
+        for row in table.find_all("tr"):
+            row_text = row.get_text(" ", strip=True)
+            row_date = self._extract_date_from_text(row_text)
+
+            player_link = row.find("a", href=player_re)
+
+            # Date-only header row (no player link) — update running date
+            if row_date and not player_link:
+                current_date = row_date
                 continue
+
+            if not player_link:
+                continue
+
+            clip_id = self._extract_clip_id(player_link["href"])
+            if clip_id is None or clip_id in seen_clip_ids:
+                continue
+            seen_clip_ids.add(clip_id)
 
             ref = ClipRef(
                 clip_id=clip_id,
                 view_id=view_id,
                 title=body_name,
-                video_url=urljoin(self.site.base_url + "/", link["href"]),
+                video_url=urljoin(self.site.base_url + "/", player_link["href"]),
+                date=row_date or current_date,
             )
 
-            # Walk up to the containing row to find sibling data
-            row = link.find_parent("tr")
-            if row:
-                self._extract_row_data(row, ref, view_id)
-
+            self._find_sibling_links(row, ref, view_id)
             refs.append(ref)
 
         # Fallback: some ViewPublisher pages use divs instead of tables.
-        # Look for clip references in any remaining anchor tags.
         if not refs:
             refs = self._parse_view_publisher_divs(soup, view_id, body_name)
 
         return refs
+
+    def _find_meeting_table(self, soup: BeautifulSoup) -> Tag | None:
+        """Locate the innermost table that contains player links.
+
+        Avoids selecting an outer layout table that merely wraps the real
+        meeting-listing table.
+        """
+        player_re = re.compile(
+            r"(player/clip/\d+|MediaPlayer\.php\?.*clip_id=\d+)"
+        )
+        candidates = [
+            t for t in soup.find_all("table")
+            if t.find("a", href=player_re)
+        ]
+        if not candidates:
+            return None
+
+        # Prefer the table that has no child-table also in the candidate set
+        # (i.e. the most specific / innermost table).
+        for table in candidates:
+            has_inner = any(
+                child in candidates
+                for child in table.find_all("table")
+            )
+            if not has_inner:
+                return table
+
+        return candidates[0]
+
+    @staticmethod
+    def _extract_date_from_text(text: str) -> str:
+        """Return the first date found in *text*, or empty string.
+
+        Uses the module-level ``_DATE_RE`` which requires real month names,
+        avoiding false positives from agenda-item numbers or durations.
+        """
+        m = _DATE_RE.search(text)
+        return m.group(1).strip() if m else ""
 
     def _parse_view_publisher_divs(self, soup: BeautifulSoup, view_id: int, body_name: str) -> list[ClipRef]:
         """Fallback parser for ViewPublisher pages that use div-based layouts."""
@@ -378,12 +437,9 @@ class GranicusScraper(BaseScraper):
             # Try to find a date near this link
             parent = link.find_parent(["div", "li", "section"])
             if parent:
-                date_match = re.search(
-                    r"(\w+ \d{1,2},\s*\d{4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2})",
-                    parent.get_text(),
-                )
-                if date_match:
-                    ref.date = date_match.group(1).strip()
+                date = self._extract_date_from_text(parent.get_text())
+                if date:
+                    ref.date = date
 
             # Look for sibling agenda/minutes links in the same container
             if parent:
@@ -395,29 +451,38 @@ class GranicusScraper(BaseScraper):
 
     def _extract_row_data(self, row: Tag, ref: ClipRef, view_id: int):
         """Extract date, agenda link, and minutes link from a table row."""
-        # Search the entire row text for a date — not just the first cell,
-        # since Granicus layouts vary in column ordering
         row_text = row.get_text(" ", strip=True)
-        date_match = re.search(
-            r"(\w+ \d{1,2},\s*\d{4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2})",
-            row_text,
-        )
-        if date_match:
-            ref.date = date_match.group(1).strip()
+        date = self._extract_date_from_text(row_text)
+        if date:
+            ref.date = date
 
         self._find_sibling_links(row, ref, view_id)
 
     def _find_sibling_links(self, container: Tag, ref: ClipRef, view_id: int):
-        """Find agenda and minutes links within a container element."""
+        """Find agenda and minutes links within a container element.
+
+        Validates that any ``clip_id`` embedded in sibling URLs matches
+        ``ref.clip_id`` so we never mix data from different meetings.
+        """
         for link in container.find_all("a", href=True):
             href = link["href"]
             if "GeneratedAgendaViewer" in href or "AgendaViewer" in href:
+                link_clip = self._extract_clip_id(href)
+                if link_clip is not None and link_clip != ref.clip_id:
+                    logger.debug(
+                        "Agenda clip_id %d != player clip_id %d — skipping",
+                        link_clip, ref.clip_id,
+                    )
+                    continue
                 ref.agenda_url = urljoin(self.site.base_url + "/", href)
                 # Try to extract event_id from agenda URL
                 event_id = self._extract_param(href, "event_id")
                 if event_id:
                     ref.event_id = int(event_id)
             elif "MinutesViewer" in href:
+                link_clip = self._extract_clip_id(href)
+                if link_clip is not None and link_clip != ref.clip_id:
+                    continue
                 ref.minutes_url = urljoin(self.site.base_url + "/", href)
 
     # ------------------------------------------------------------------
@@ -594,31 +659,23 @@ class GranicusScraper(BaseScraper):
         return items, meeting_docs, page_date
 
     def _extract_date_from_page(self, soup: BeautifulSoup) -> str | None:
-        """Try to extract a date from the page title, headers, or meta tags."""
-        DATE_RE = re.compile(
-            r"(\w+ \d{1,2},\s*\d{4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2})"
-        )
-
+        """Try to extract a date from the page title, headers, or body text."""
         # Check <title>
         title = soup.find("title")
         if title:
-            m = DATE_RE.search(title.get_text())
-            if m:
-                return m.group(1).strip()
+            d = self._extract_date_from_text(title.get_text())
+            if d:
+                return d
 
         # Check headings
         for tag in soup.find_all(["h1", "h2", "h3", "h4"]):
-            m = DATE_RE.search(tag.get_text())
-            if m:
-                return m.group(1).strip()
+            d = self._extract_date_from_text(tag.get_text())
+            if d:
+                return d
 
         # Check first ~2000 chars of the page text
         text = soup.get_text(" ", strip=True)[:2000]
-        m = DATE_RE.search(text)
-        if m:
-            return m.group(1).strip()
-
-        return None
+        return self._extract_date_from_text(text) or None
 
     def _parse_agenda_table(
         self, soup: BeautifulSoup, view_id: int, clip_id: int
