@@ -9,6 +9,9 @@ dependencies = [
     "jsonschema>=4.20",
 ]
 
+[tool.setuptools.packages.find]
+include = ["scrapers*"]
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
