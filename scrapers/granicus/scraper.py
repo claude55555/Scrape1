@@ -46,9 +46,9 @@ _MONTH_RE = (
     r"|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
 )
 _DATE_RE = re.compile(
-    rf"({_MONTH_RE}\s+\d{{1,2}},\s*\d{{4}}"   # January 15, 2025
-    rf"|\d{{1,2}}/\d{{1,2}}/\d{{2,4}}"          # 1/15/2025 or 1/15/25
-    rf"|\d{{4}}-\d{{2}}-\d{{2}})",               # 2025-01-15
+    rf"({_MONTH_RE}\.?\s+\d{{1,2}},?\s+\d{{4}}"  # Jan 15, 2025 / Jan. 15 2025
+    rf"|\d{{1,2}}/\d{{1,2}}/\d{{2,4}}"             # 1/15/2025 or 1/15/25
+    rf"|\d{{4}}-\d{{2}}-\d{{2}})",                  # 2025-01-15
     re.IGNORECASE,
 )
 
@@ -339,15 +339,22 @@ class GranicusScraper(BaseScraper):
         seen_clip_ids: set[int] = set()
         current_date = ""
 
-        for row in table.find_all("tr"):
+        # Only iterate direct child rows of the table (via <tbody> if
+        # present) so we never accidentally process rows that live inside
+        # nested formatting tables within a cell.
+        row_parent = table.find("tbody") or table
+        for row in row_parent.find_all("tr", recursive=False):
             row_text = row.get_text(" ", strip=True)
             row_date = self._extract_date_from_text(row_text)
 
             player_link = row.find("a", href=player_re)
 
-            # Date-only header row (no player link) — update running date
+            # Date-only header row — update running date, but only when
+            # the row is short (just a date, not a paragraph that happens
+            # to contain one).
             if row_date and not player_link:
-                current_date = row_date
+                if len(row_text) < len(row_date) + 30:
+                    current_date = row_date
                 continue
 
             if not player_link:
@@ -627,10 +634,16 @@ class GranicusScraper(BaseScraper):
         page_date = self._extract_date_from_page(soup)
 
         # --- Parse agenda items ---
-        # Strategy 1: Look for a table with agenda rows (most common Granicus layout)
-        items = self._parse_agenda_table(soup, view_id, clip_id)
+        # Primary strategy: Granicus universally uses <b>/<strong> tags for
+        # agenda-item titles regardless of the surrounding HTML layout
+        # (tables, divs, flat markup, or one-row-per-item mini-tables).
+        items = self._parse_agenda_bold(soup, view_id, clip_id)
 
-        # Strategy 2: Try structured div-based agenda
+        # Fallback 1: structured table
+        if not items:
+            items = self._parse_agenda_table(soup, view_id, clip_id)
+
+        # Fallback 2: structured div container
         if not items:
             agenda_container = (
                 soup.find("div", class_=re.compile(r"agenda", re.I))
@@ -638,11 +651,10 @@ class GranicusScraper(BaseScraper):
                 or soup.find("div", id="recorddetail_content")
                 or soup.find("div", class_="recorddetail")
             )
-
             if agenda_container:
                 items = self._parse_agenda_container(agenda_container, view_id, clip_id)
 
-        # Strategy 3: Flat parse of the whole page
+        # Fallback 3: flat numbered-text parse
         if not items:
             items = self._parse_agenda_flat(soup, view_id, clip_id)
 
@@ -676,6 +688,101 @@ class GranicusScraper(BaseScraper):
         # Check first ~2000 chars of the page text
         text = soup.get_text(" ", strip=True)[:2000]
         return self._extract_date_from_text(text) or None
+
+    def _parse_agenda_bold(
+        self, soup: BeautifulSoup, view_id: int, clip_id: int
+    ) -> list[dict]:
+        """Parse agenda items by locating <b>/<strong> markers.
+
+        Granicus GeneratedAgendaViewer universally wraps every agenda-item
+        title in bold text, regardless of the surrounding HTML layout
+        (tables, divs, flat markup, or one-row-per-item mini-tables).
+        This strategy finds bold elements and pairs each with any adjacent
+        video-timestamp links and MetaViewer document links.
+        """
+        # Noise words that appear in bold but are not agenda items
+        SKIP = {
+            "video", "agenda", "minutes", "back", "home", "print",
+            "close", "search", "login", "granicus", "",
+        }
+
+        items: list[dict] = []
+        seen_titles: set[str] = set()
+
+        for bold in soup.find_all(["b", "strong"]):
+            text = bold.get_text(strip=True)
+            if not text or len(text) < 3:
+                continue
+
+            # Skip navigation / chrome text
+            if text.lower().strip("»«:") in SKIP:
+                continue
+
+            # Skip page-header text: Granicus always center-aligns the
+            # meeting title / date / time block.  Actual agenda items are
+            # never centered, so centered bold text is always chrome —
+            # unless it starts with a digit (rare edge case).
+            if not re.match(r"^\d", text):
+                if self._is_centered(bold):
+                    continue
+
+            # Skip if the text is primarily a date (possibly with a time
+            # suffix like "February 4, 2025 - 6:00 PM")
+            date_m = _DATE_RE.search(text)
+            if date_m and len(text) < len(date_m.group(1)) + 20:
+                continue
+
+            # Skip duplicate titles
+            if text in seen_titles:
+                continue
+            seen_titles.add(text)
+
+            # Extract order number from the text itself
+            order = None
+            title = text
+            m = re.match(
+                r"^(\d+[a-z]?[\.\)]?)\s*\.?\s+(.+)", text, re.DOTALL
+            )
+            if m:
+                order = m.group(1).rstrip(".)")
+                title = m.group(2).strip()
+            else:
+                # Roman or letter prefix: "IV. Public Hearing"
+                m2 = re.match(
+                    r"^([A-Z]{1,5}[\.\)]|[IVXLC]+[\.\)])\s+(.+)", text
+                )
+                if m2:
+                    order = m2.group(1).rstrip(".)")
+                    title = m2.group(2).strip()
+
+            if not title or len(title) < 3:
+                continue
+
+            item: dict = {"title": title}
+            if order:
+                item["order"] = order
+            item["classification"] = self._classify_item(title)
+
+            # Walk up to the nearest block-level container to find
+            # associated video-timestamp and document links.
+            container = bold.parent
+            # Go one more level up if the parent is a tiny inline wrapper
+            # (e.g. <td><b>Title</b></td> — we want the <tr>)
+            if container and container.name in ("td", "span", "font", "p"):
+                container = container.parent or container
+
+            if container:
+                docs = self._extract_documents(container, view_id, clip_id)
+                if docs:
+                    item["documents"] = docs
+
+                media_ref = self._extract_media_ref(container, clip_id)
+                if media_ref:
+                    item["media_ref"] = media_ref
+
+            items.append(item)
+
+        return items
 
     def _parse_agenda_table(
         self, soup: BeautifulSoup, view_id: int, clip_id: int
@@ -1193,6 +1300,21 @@ class GranicusScraper(BaseScraper):
     # Helpers: classification, date parsing, URL parsing
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_centered(el: Tag) -> bool:
+        """Return True if *el* (or an ancestor) is center-aligned."""
+        node = el
+        while node and node.name not in ("body", "html", "[document]"):
+            style = node.get("style") or ""
+            if "text-align" in style and "center" in style:
+                return True
+            if (node.get("align") or "").lower() == "center":
+                return True
+            if node.name == "center":
+                return True
+            node = node.parent
+        return False
+
     def _classify_item(self, title: str) -> str | None:
         """Guess the classification of an agenda item from its title."""
         t = title.lower()
@@ -1217,15 +1339,19 @@ class GranicusScraper(BaseScraper):
         if not s:
             return None
 
+        # Normalise: "Feb." → "Feb", collapse whitespace
+        s = re.sub(r"\s+", " ", s.strip())
+        s = re.sub(r"(\b\w{3})\.", r"\1", s)  # strip period after 3-letter abbrev
+
         formats = [
             "%B %d, %Y",       # March 15, 2025
             "%b %d, %Y",       # Mar 15, 2025
+            "%B %d %Y",        # March 15 2025  (no comma)
+            "%b %d %Y",        # Mar 15 2025    (no comma)
             "%m/%d/%Y",        # 03/15/2025
             "%m/%d/%y",        # 03/15/25
             "%Y-%m-%d",        # 2025-03-15
         ]
-        # Clean up whitespace
-        s = re.sub(r"\s+", " ", s.strip())
 
         for fmt in formats:
             try:
