@@ -10,6 +10,10 @@ examples/                       # Sample meeting files that validate against the
 scrapers/
   base.py                       # Base class all scrapers inherit from
   example/scraper.py            # Annotated example — copy this to start a new scraper
+  granicus/                     # Granicus Classic platform scraper
+    scraper.py                  #   Core scraper (ViewPublisher, AgendaViewer, player)
+    sites.py                    #   Known city configurations
+    __main__.py                 #   CLI entry point
 validate.py                     # CLI tool to validate output files
 ```
 
@@ -57,6 +61,37 @@ Key things every scraper should populate:
 - **`start_date`** — ISO 8601 with timezone
 - **`agenda_items`** — the ordered list with `title`, `order`, and `classification`
 - **`sources`** — where the data was scraped from, with `retrieved_at` timestamp
+
+## Granicus Classic scraper
+
+The first real scraper targets the classic Granicus platform used by many
+municipalities (`{city}.granicus.com` with `ViewPublisher.php`, `GeneratedAgendaViewer.php`,
+`/player/clip/{id}`).
+
+```bash
+# List known sites
+python -m scrapers.granicus --list-sites
+
+# Scrape a specific city
+python -m scrapers.granicus erie --start-date 2025-01-01
+
+# Scrape a custom Granicus site by subdomain
+python -m scrapers.granicus --subdomain burbank --view-id 1 --body "City Council"
+
+# Scrape all known sites
+python -m scrapers.granicus --all --start-date 2025-06-01 -v
+```
+
+**Currently configured sites:** Erie CO, Simi Valley CA, Sacramento CA, Kirkland WA, Shoreline WA.
+Add more in `scrapers/granicus/sites.py`.
+
+**How it works:**
+1. Scrapes `ViewPublisher.php` to discover all archived meeting clips for each body
+2. For each clip, fetches `GeneratedAgendaViewer.php` to get structured agenda items,
+   document links, and video timestamps
+3. Fetches the `/player/clip/{id}` page to extract video stream URLs and duration
+4. Checks `MinutesViewer.php` for approved minutes documents
+5. Assembles everything into one Open Civic Agenda JSON file per meeting
 
 ## Validating output
 
