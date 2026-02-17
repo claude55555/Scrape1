@@ -138,8 +138,19 @@ class GranicusScraper(BaseScraper):
         self.jurisdiction_name = site.jurisdiction_name
         self.jurisdiction_url = site.jurisdiction_url
         self.request_delay = request_delay
+        self._current_clip_id: int | None = None
 
         super().__init__(output_dir)
+
+    def output_filename(self, meeting: dict) -> str:
+        """Include clip_id in filenames so meetings never collide."""
+        org = meeting.get("organization", {})
+        org_name = org.get("name", org) if isinstance(org, dict) else org
+        slug = re.sub(r"[^a-z0-9]+", "-", org_name.lower()).strip("-")
+
+        date_str = meeting["start_date"][:10]
+        clip_id = self._current_clip_id or "unknown"
+        return f"{slug}_{date_str}_clip-{clip_id}.json"
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -384,15 +395,12 @@ class GranicusScraper(BaseScraper):
 
     def _extract_row_data(self, row: Tag, ref: ClipRef, view_id: int):
         """Extract date, agenda link, and minutes link from a table row."""
-        cells = row.find_all("td")
-        if not cells:
-            return
-
-        # Date is typically in the first cell
-        date_text = cells[0].get_text(strip=True)
+        # Search the entire row text for a date — not just the first cell,
+        # since Granicus layouts vary in column ordering
+        row_text = row.get_text(" ", strip=True)
         date_match = re.search(
             r"(\w+ \d{1,2},\s*\d{4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2})",
-            date_text,
+            row_text,
         )
         if date_match:
             ref.date = date_match.group(1).strip()
@@ -434,27 +442,35 @@ class GranicusScraper(BaseScraper):
 
         logger.info("Scraping clip %d (%s, %s)", clip_id, body_name, raw_date)
 
-        # Parse the date
+        # Parse the date — will try agenda page as fallback below if this fails
         parsed_date = self._parse_date_str(raw_date)
-        if parsed_date:
-            start_date = parsed_date.isoformat()
-        else:
-            start_date = raw_date or "unknown"
+        start_date = parsed_date.isoformat() if parsed_date else None
 
         # Build the body slug and org ID
         body_slug = re.sub(r"[^a-z0-9]+", "-", body_name.lower()).strip("-")
 
-        # Scrape agenda items
+        # Override output filename to include clip_id (prevents collisions)
+        self._current_clip_id = clip_id
+
+        # Scrape agenda items (also returns a date extracted from the page header)
         agenda_items = []
         agenda_docs = []
-        if agenda_url:
-            agenda_items, agenda_docs = self._scrape_agenda(agenda_url, view_id, clip_id)
-        else:
-            # Try constructing the URL ourselves
-            constructed_url = self._url(
-                "GeneratedAgendaViewer.php", view_id=view_id, clip_id=clip_id
-            )
-            agenda_items, agenda_docs = self._scrape_agenda(constructed_url, view_id, clip_id)
+        actual_agenda_url = agenda_url or self._url(
+            "GeneratedAgendaViewer.php", view_id=view_id, clip_id=clip_id
+        )
+        agenda_items, agenda_docs, agenda_date = self._scrape_agenda(
+            actual_agenda_url, view_id, clip_id
+        )
+
+        # Use agenda page date as fallback
+        if not start_date and agenda_date:
+            parsed_date = self._parse_date_str(agenda_date)
+            if parsed_date:
+                start_date = parsed_date.isoformat()
+
+        # Last resort: use raw date string or "unknown"
+        if not start_date:
+            start_date = raw_date or "unknown"
 
         # Scrape video metadata from the player page
         media = self._scrape_media(clip_id, view_id)
@@ -521,10 +537,10 @@ class GranicusScraper(BaseScraper):
 
     def _scrape_agenda(
         self, url: str, view_id: int, clip_id: int
-    ) -> tuple[list[dict], list[dict]]:
+    ) -> tuple[list[dict], list[dict], str | None]:
         """Parse a GeneratedAgendaViewer page.
 
-        Returns (agenda_items, meeting_level_documents).
+        Returns (agenda_items, meeting_level_documents, date_string).
 
         The agenda viewer page typically has:
         - A header with meeting title, date, time, location
@@ -537,32 +553,32 @@ class GranicusScraper(BaseScraper):
             soup = self._soup(url)
         except requests.RequestException as e:
             logger.warning("Could not fetch agenda at %s: %s", url, e)
-            return [], []
+            return [], [], None
 
         items = []
         meeting_docs = []
 
-        # Look for the agenda content — usually in a div or table structure
-        # Common patterns:
-        #   <div class="generated-agenda"> or <div id="generated-agenda-viewer">
-        #   <table class="agenda-table">
-        #   <ol> / <ul> with agenda entries
+        # Extract date from the page header/title — useful as fallback
+        page_date = self._extract_date_from_page(soup)
 
-        # Strategy: find all elements that look like agenda items.
-        # Granicus uses numbered/lettered entries with links to documents and video.
+        # --- Parse agenda items ---
+        # Strategy 1: Look for a table with agenda rows (most common Granicus layout)
+        items = self._parse_agenda_table(soup, view_id, clip_id)
 
-        # Try structured div-based agenda first
-        agenda_container = (
-            soup.find("div", class_=re.compile(r"agenda", re.I))
-            or soup.find("div", id=re.compile(r"agenda", re.I))
-            or soup.find("div", id="recorddetail_content")
-            or soup.find("div", class_="recorddetail")
-        )
+        # Strategy 2: Try structured div-based agenda
+        if not items:
+            agenda_container = (
+                soup.find("div", class_=re.compile(r"agenda", re.I))
+                or soup.find("div", id=re.compile(r"agenda", re.I))
+                or soup.find("div", id="recorddetail_content")
+                or soup.find("div", class_="recorddetail")
+            )
 
-        if agenda_container:
-            items = self._parse_agenda_container(agenda_container, view_id, clip_id)
-        else:
-            # Fallback: try to parse the whole body for agenda-like structures
+            if agenda_container:
+                items = self._parse_agenda_container(agenda_container, view_id, clip_id)
+
+        # Strategy 3: Flat parse of the whole page
+        if not items:
             items = self._parse_agenda_flat(soup, view_id, clip_id)
 
         # Look for a meeting-level agenda PDF link
@@ -575,7 +591,138 @@ class GranicusScraper(BaseScraper):
                     "type": "agenda" if "agenda" in text else "packet",
                 })
 
-        return items, meeting_docs
+        return items, meeting_docs, page_date
+
+    def _extract_date_from_page(self, soup: BeautifulSoup) -> str | None:
+        """Try to extract a date from the page title, headers, or meta tags."""
+        DATE_RE = re.compile(
+            r"(\w+ \d{1,2},\s*\d{4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2})"
+        )
+
+        # Check <title>
+        title = soup.find("title")
+        if title:
+            m = DATE_RE.search(title.get_text())
+            if m:
+                return m.group(1).strip()
+
+        # Check headings
+        for tag in soup.find_all(["h1", "h2", "h3", "h4"]):
+            m = DATE_RE.search(tag.get_text())
+            if m:
+                return m.group(1).strip()
+
+        # Check first ~2000 chars of the page text
+        text = soup.get_text(" ", strip=True)[:2000]
+        m = DATE_RE.search(text)
+        if m:
+            return m.group(1).strip()
+
+        return None
+
+    def _parse_agenda_table(
+        self, soup: BeautifulSoup, view_id: int, clip_id: int
+    ) -> list[dict]:
+        """Parse agenda items from HTML tables.
+
+        Real Granicus GeneratedAgendaViewer pages commonly use <table> layouts
+        where each row is an agenda item. Rows may contain:
+        - Cells with item number, title, document links, video links
+        - Colspan rows for section headers
+        - Nested tables or divs for sub-items
+        """
+        items = []
+
+        # Find all tables on the page
+        for table in soup.find_all("table"):
+            rows = table.find_all("tr")
+            if len(rows) < 2:
+                continue
+
+            for row in rows:
+                cells = row.find_all(["td", "th"])
+                if not cells:
+                    continue
+
+                # Get the full text of the row
+                row_text = row.get_text(" ", strip=True)
+                if not row_text or len(row_text) < 3:
+                    continue
+
+                # Skip pure navigation / header rows
+                if row_text.lower() in ("video", "agenda", "minutes", "date", "duration"):
+                    continue
+
+                # Check if this row has an agenda item link (video timestamp or document)
+                has_links = bool(
+                    row.find("a", href=re.compile(
+                        r"(player/clip|MediaPlayer|MetaViewer|entrytime|starttime)"
+                    ))
+                )
+
+                # Also accept rows that have substantive text content
+                # (some agenda items don't have links)
+                text_content = ""
+                for cell in cells:
+                    cell_text = cell.get_text(strip=True)
+                    if len(cell_text) > len(text_content):
+                        text_content = cell_text
+
+                if not text_content or len(text_content) < 3:
+                    continue
+
+                # Try to extract order number and title
+                order = None
+                title = text_content
+
+                # Check if the first non-empty cell is just a number
+                for cell in cells:
+                    ct = cell.get_text(strip=True)
+                    if not ct:
+                        continue
+                    m = re.match(r"^(\d+[a-z]?\.?\)?|[A-Z]\.?\)?|[IVXLC]+\.?\)?)$", ct)
+                    if m:
+                        order = ct.rstrip(".)")
+                        # Title is the next cell with content
+                        for other_cell in cells:
+                            ot = other_cell.get_text(strip=True)
+                            if ot and ot != ct and len(ot) > len(ct):
+                                title = ot
+                                break
+                        break
+                    else:
+                        # First cell has text — might be "1. Title" combined
+                        m2 = re.match(r"^(\d+[a-z]?[\.\)]?)\s+(.+)", ct)
+                        if m2:
+                            order = m2.group(1).rstrip(".)")
+                            title = m2.group(2).strip()
+                        else:
+                            title = ct
+                        break
+
+                if not title or len(title) < 3:
+                    continue
+
+                item: dict = {"title": title}
+                if order:
+                    item["order"] = order
+
+                item["classification"] = self._classify_item(title)
+
+                # Extract documents and media refs from the row
+                docs = self._extract_documents(row, view_id, clip_id)
+                if docs:
+                    item["documents"] = docs
+
+                media_ref = self._extract_media_ref(row, clip_id)
+                if media_ref:
+                    item["media_ref"] = media_ref
+
+                # Skip if this looks like a duplicate (same title already seen)
+                if not any(existing["title"] == title for existing in items):
+                    items.append(item)
+
+        return items
 
     def _parse_agenda_container(
         self, container: Tag, view_id: int, clip_id: int
