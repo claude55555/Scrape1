@@ -24,8 +24,10 @@ import json
 import logging
 import re
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import requests
@@ -316,14 +318,22 @@ class GranicusScraper(BaseScraper):
         return [self._clip_ref_to_dict(r) for r in filtered]
 
     def _parse_view_publisher(self, view_id: int, body_name: str) -> list[ClipRef]:
-        """Parse the ViewPublisher.php page for a single view.
+        """Parse meetings for a single view.
 
-        Iterates table rows top-to-bottom so that date-only header rows
-        (``<tr><td colspan="5">January 15, 2025</td></tr>``) are tracked
-        and applied to the clip rows that follow.  Agenda/minutes URLs
-        are cross-validated against the player link's clip_id so data
-        from different meetings is never mixed into a single record.
+        Primary strategy: RSS feed (``ViewPublisherRSS.php``), which
+        provides structured data with unambiguous date-to-clip mapping.
+
+        Fallback: HTML scraping of ``ViewPublisher.php``, iterating table
+        rows top-to-bottom with date-header tracking and clip_id
+        cross-validation.
         """
+        # --- Primary: RSS feed ---
+        refs = self._parse_view_publisher_rss(view_id, body_name)
+        if refs:
+            logger.info("  Parsed %d clips from RSS feed", len(refs))
+            return refs
+
+        # --- Fallback: HTML scraping ---
         url = self._url("ViewPublisher.php", view_id=view_id)
         soup = self._soup(url)
 
@@ -379,6 +389,88 @@ class GranicusScraper(BaseScraper):
         # Fallback: some ViewPublisher pages use divs instead of tables.
         if not refs:
             refs = self._parse_view_publisher_divs(soup, view_id, body_name)
+
+        return refs
+
+    def _parse_view_publisher_rss(self, view_id: int, body_name: str) -> list[ClipRef]:
+        """Parse meeting listings from the ViewPublisher RSS feed.
+
+        The RSS feed at ``ViewPublisherRSS.php`` provides each clip with
+        its own ``<link>`` (containing the clip_id) and ``<pubDate>``
+        (RFC 822 date).  This avoids the ambiguity of HTML table parsing
+        where dates can be mis-associated with clips.
+
+        The ``<description>`` CDATA may contain HTML links to the agenda
+        viewer and minutes viewer, which we also extract.
+        """
+        url = self._url("ViewPublisherRSS.php", view_id=view_id)
+        try:
+            resp = self._get(url)
+        except requests.RequestException as e:
+            logger.debug("RSS feed not available for view %d: %s", view_id, e)
+            return []
+
+        try:
+            root = ET.fromstring(resp.content)
+        except ET.ParseError as e:
+            logger.debug("RSS parse error for view %d: %s", view_id, e)
+            return []
+
+        refs: list[ClipRef] = []
+        seen: set[int] = set()
+
+        for item in root.iter("item"):
+            # Extract clip_id from <link> (points to MediaPlayer.php?clip_id=N)
+            link_el = item.find("link")
+            if link_el is None or not link_el.text:
+                continue
+
+            clip_id = self._extract_clip_id(link_el.text.strip())
+            if clip_id is None or clip_id in seen:
+                continue
+            seen.add(clip_id)
+
+            # Parse date from <pubDate> (RFC 822)
+            date_str = ""
+            pub_date_el = item.find("pubDate")
+            if pub_date_el is not None and pub_date_el.text:
+                try:
+                    dt = parsedate_to_datetime(pub_date_el.text.strip())
+                    date_str = dt.strftime("%B %d, %Y")  # "June 11, 2025"
+                except (ValueError, TypeError):
+                    pass
+
+            # Fallback: extract date from <title>
+            title_el = item.find("title")
+            title_text = title_el.text.strip() if title_el is not None and title_el.text else ""
+            if not date_str and title_text:
+                date_str = self._extract_date_from_text(title_text)
+
+            # Parse agenda/minutes URLs from <description> CDATA
+            agenda_url = None
+            minutes_url = None
+            desc_el = item.find("description")
+            if desc_el is not None and desc_el.text:
+                desc_soup = BeautifulSoup(desc_el.text, "html.parser")
+                for a in desc_soup.find_all("a", href=True):
+                    href = a["href"]
+                    if not agenda_url and (
+                        "GeneratedAgendaViewer" in href or "AgendaViewer" in href
+                    ):
+                        agenda_url = urljoin(self.site.base_url + "/", href)
+                    elif not minutes_url and "MinutesViewer" in href:
+                        minutes_url = urljoin(self.site.base_url + "/", href)
+
+            ref = ClipRef(
+                clip_id=clip_id,
+                view_id=view_id,
+                title=body_name or title_text,
+                date=date_str,
+                video_url=urljoin(self.site.base_url + "/", link_el.text.strip()),
+                agenda_url=agenda_url,
+                minutes_url=minutes_url,
+            )
+            refs.append(ref)
 
         return refs
 
@@ -610,65 +702,132 @@ class GranicusScraper(BaseScraper):
     def _scrape_agenda(
         self, url: str, view_id: int, clip_id: int
     ) -> tuple[list[dict], list[dict], str | None]:
-        """Parse a GeneratedAgendaViewer page.
+        """Fetch agenda items for a meeting.
 
         Returns (agenda_items, meeting_level_documents, date_string).
 
-        The agenda viewer page typically has:
-        - A header with meeting title, date, time, location
-        - A structured list of agenda items, potentially nested
-        - Each item may link to:
-          - A video timestamp (meta_id parameter in player links)
-          - Attached documents via MetaViewer.php links
+        Primary strategy: ``JSON.php?clip_id=N`` which returns structured
+        chapter-marker / agenda-item data in JSON.
+
+        Fallback: HTML scraping of the ``GeneratedAgendaViewer.php`` page
+        using bold-text detection, table parsing, and other heuristics.
         """
+        meeting_docs: list[dict] = []
+        page_date: str | None = None
+
+        # --- Primary: JSON.php structured data ---
+        items = self._scrape_agenda_json(clip_id)
+        if items:
+            logger.info("  Parsed %d agenda items from JSON.php", len(items))
+
+        # --- Fallback: HTML scraping of GeneratedAgendaViewer ---
+        # We still fetch the HTML page for:
+        #   1. The date header (used as fallback when RSS date is missing)
+        #   2. Meeting-level document links (full agenda PDFs)
+        #   3. Agenda items if JSON.php returned nothing
+        soup = None
         try:
             soup = self._soup(url)
         except requests.RequestException as e:
             logger.warning("Could not fetch agenda at %s: %s", url, e)
-            return [], [], None
 
-        items = []
-        meeting_docs = []
+        if soup is not None:
+            page_date = self._extract_date_from_page(soup)
 
-        # Extract date from the page header/title — useful as fallback
-        page_date = self._extract_date_from_page(soup)
+            if not items:
+                # Try HTML-based agenda parsers
+                items = self._parse_agenda_bold(soup, view_id, clip_id)
 
-        # --- Parse agenda items ---
-        # Primary strategy: Granicus universally uses <b>/<strong> tags for
-        # agenda-item titles regardless of the surrounding HTML layout
-        # (tables, divs, flat markup, or one-row-per-item mini-tables).
-        items = self._parse_agenda_bold(soup, view_id, clip_id)
+                if not items:
+                    items = self._parse_agenda_table(soup, view_id, clip_id)
 
-        # Fallback 1: structured table
-        if not items:
-            items = self._parse_agenda_table(soup, view_id, clip_id)
+                if not items:
+                    agenda_container = (
+                        soup.find("div", class_=re.compile(r"agenda", re.I))
+                        or soup.find("div", id=re.compile(r"agenda", re.I))
+                        or soup.find("div", id="recorddetail_content")
+                        or soup.find("div", class_="recorddetail")
+                    )
+                    if agenda_container:
+                        items = self._parse_agenda_container(
+                            agenda_container, view_id, clip_id
+                        )
 
-        # Fallback 2: structured div container
-        if not items:
-            agenda_container = (
-                soup.find("div", class_=re.compile(r"agenda", re.I))
-                or soup.find("div", id=re.compile(r"agenda", re.I))
-                or soup.find("div", id="recorddetail_content")
-                or soup.find("div", class_="recorddetail")
-            )
-            if agenda_container:
-                items = self._parse_agenda_container(agenda_container, view_id, clip_id)
+                if not items:
+                    items = self._parse_agenda_flat(soup, view_id, clip_id)
 
-        # Fallback 3: flat numbered-text parse
-        if not items:
-            items = self._parse_agenda_flat(soup, view_id, clip_id)
-
-        # Look for a meeting-level agenda PDF link
-        for link in soup.find_all("a", href=re.compile(r"MetaViewer\.php")):
-            text = link.get_text(strip=True).lower()
-            if "full agenda" in text or "agenda packet" in text or "meeting packet" in text:
-                meeting_docs.append({
-                    "title": link.get_text(strip=True),
-                    "url": urljoin(self.site.base_url + "/", link["href"]),
-                    "type": "agenda" if "agenda" in text else "packet",
-                })
+            # Look for meeting-level agenda PDF links (always, regardless
+            # of which strategy produced agenda items)
+            for link in soup.find_all("a", href=re.compile(r"MetaViewer\.php")):
+                text = link.get_text(strip=True).lower()
+                if "full agenda" in text or "agenda packet" in text or "meeting packet" in text:
+                    meeting_docs.append({
+                        "title": link.get_text(strip=True),
+                        "url": urljoin(self.site.base_url + "/", link["href"]),
+                        "type": "agenda" if "agenda" in text else "packet",
+                    })
 
         return items, meeting_docs, page_date
+
+    def _scrape_agenda_json(self, clip_id: int) -> list[dict]:
+        """Fetch agenda items from the ``JSON.php`` endpoint.
+
+        Granicus serves caption/chapter-marker data at
+        ``JSON.php?clip_id=N``.  Entries with ``"type": "meta"`` are
+        agenda-item markers with titles and video timestamps — the same
+        data that appears in the agenda viewer, but in a reliable
+        structured format.
+        """
+        url = self._url("JSON.php", clip_id=clip_id)
+        try:
+            resp = self._get(url)
+            data = resp.json()
+        except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
+            logger.debug("JSON.php not available for clip %d: %s", clip_id, e)
+            return []
+
+        if not isinstance(data, list):
+            return []
+
+        # Flatten: data is typically [[{...}, {...}], [{...}]]
+        entries: list[dict] = []
+        for element in data:
+            if isinstance(element, list):
+                entries.extend(e for e in element if isinstance(e, dict))
+            elif isinstance(element, dict):
+                entries.append(element)
+
+        items: list[dict] = []
+        order_num = 0
+        for entry in entries:
+            if entry.get("type") != "meta":
+                continue
+
+            title = (entry.get("title") or entry.get("name") or "").strip()
+            if not title or len(title) < 3:
+                continue
+
+            order_num += 1
+            item: dict = {
+                "title": title,
+                "order": str(order_num),
+                "classification": self._classify_item(title),
+            }
+
+            # Add video timestamp if available
+            timestamp = entry.get("time")
+            if timestamp is not None:
+                try:
+                    item["media_ref"] = {
+                        "media_id": f"clip-{clip_id}",
+                        "offset_seconds": int(float(timestamp)),
+                    }
+                except (ValueError, TypeError):
+                    pass
+
+            items.append(item)
+
+        return items
 
     def _extract_date_from_page(self, soup: BeautifulSoup) -> str | None:
         """Try to extract a date from the page title, headers, or body text."""
