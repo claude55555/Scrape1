@@ -694,13 +694,15 @@ class GranicusScraper(BaseScraper):
             start_date = raw_date or "unknown"
 
         # Scrape video metadata from the player page (also extracts
-        # index-point agenda items as a fallback).
+        # index-point agenda items with timestamps).
         media, index_items = self._scrape_media(clip_id, view_id)
 
-        # Use player index points if agenda parsing produced nothing
-        if not agenda_items and index_items:
-            logger.info("  Using %d index points from player page as agenda", len(index_items))
-            agenda_items = index_items
+        # Merge player index points with agenda items (enriches HTML
+        # items with timestamps, appends unmatched procedural markers).
+        if index_items:
+            agenda_items = self._merge_agenda_sources(
+                agenda_items, index_items, clip_id
+            )
 
         # Scrape minutes if available
         minutes_doc = None
@@ -769,25 +771,24 @@ class GranicusScraper(BaseScraper):
 
         Returns (agenda_items, meeting_level_documents, date_string).
 
-        Primary strategy: ``JSON.php?clip_id=N`` which returns structured
-        chapter-marker / agenda-item data in JSON.
-
-        Fallback: HTML scraping of the ``GeneratedAgendaViewer.php`` page
-        using bold-text detection, table parsing, and other heuristics.
+        Strategy:
+            1. **HTML agenda page** is the primary source — it has the
+               published agenda structure with hierarchy (section/item/sub)
+               and links to documents (staff reports, etc.).
+            2. **JSON.php** provides video-marker data with reliable
+               timestamps for each agenda item.
+            3. The two sources are **merged**: HTML items are enriched
+               with timestamps from matching markers, and unmatched
+               markers (procedural items like votes, roll calls) are
+               appended with ``source="video_markers"``.
         """
         meeting_docs: list[dict] = []
         page_date: str | None = None
 
-        # --- Primary: JSON.php structured data ---
-        items = self._scrape_agenda_json(clip_id)
-        if items:
-            logger.info("  Parsed %d agenda items from JSON.php", len(items))
-
-        # --- Fallback: HTML scraping of GeneratedAgendaViewer ---
-        # We still fetch the HTML page for:
-        #   1. The date header (used as fallback when RSS date is missing)
-        #   2. Meeting-level document links (full agenda PDFs)
-        #   3. Agenda items if JSON.php returned nothing
+        # --- Step 1: Parse HTML agenda page (primary source) ---
+        # This gives us the published agenda structure, hierarchy, and
+        # document links.
+        html_items: list[dict] = []
         soup = None
         try:
             soup = self._soup(url)
@@ -797,33 +798,141 @@ class GranicusScraper(BaseScraper):
         if soup is not None:
             page_date = self._extract_date_from_page(soup)
 
-            if not items:
-                # Strategy 1: Granicus CSS-class markers
-                # (class="Agenda Agenda0/1/2" links — Sacramento pattern)
-                items = self._parse_agenda_granicus_classes(soup, view_id, clip_id)
+            # Strategy 1: Granicus CSS-class markers
+            # (class="Agenda Agenda0/1/2" links — Sacramento pattern)
+            html_items = self._parse_agenda_granicus_classes(soup, view_id, clip_id)
 
-                # Strategy 2: Heading-based items
-                # (<h2>/<h3> with span-based numbers — Shoreline pattern)
-                if not items:
-                    items = self._parse_agenda_headings(soup, view_id, clip_id)
+            # Strategy 2: Heading-based items
+            # (<h2>/<h3> with span-based numbers — Shoreline pattern)
+            if not html_items:
+                html_items = self._parse_agenda_headings(soup, view_id, clip_id)
 
-                # Strategy 3: Bold text
-                if not items:
-                    items = self._parse_agenda_bold(soup, view_id, clip_id)
+            # Strategy 3: Bold text
+            if not html_items:
+                html_items = self._parse_agenda_bold(soup, view_id, clip_id)
 
-                # Strategy 4: structured table
-                if not items:
-                    items = self._parse_agenda_table(soup, view_id, clip_id)
+            # Strategy 4: structured table
+            if not html_items:
+                html_items = self._parse_agenda_table(soup, view_id, clip_id)
 
-                # Strategy 5: flat numbered-text parse
-                if not items:
-                    items = self._parse_agenda_flat(soup, view_id, clip_id)
+            # Strategy 5: flat numbered-text parse
+            if not html_items:
+                html_items = self._parse_agenda_flat(soup, view_id, clip_id)
+
+            if html_items:
+                logger.info(
+                    "  Parsed %d agenda items from HTML page", len(html_items)
+                )
 
             # Extract meeting-level documents using class="Document"
             # selectors (reliable across Granicus sites).
             meeting_docs = self._extract_meeting_level_docs(soup)
 
+        # --- Step 2: Fetch JSON.php video-marker data ---
+        marker_items = self._scrape_agenda_json(clip_id)
+        if marker_items:
+            logger.info(
+                "  Parsed %d video markers from JSON.php", len(marker_items)
+            )
+
+        # --- Step 3: Merge both sources ---
+        items = self._merge_agenda_sources(html_items, marker_items, clip_id)
+
         return items, meeting_docs, page_date
+
+    def _merge_agenda_sources(
+        self,
+        html_items: list[dict],
+        marker_items: list[dict],
+        clip_id: int,
+    ) -> list[dict]:
+        """Merge HTML agenda items with JSON.php video markers.
+
+        For items that appear in both sources (matched by title
+        similarity), the HTML item is kept and enriched with the
+        marker's video timestamp.  Unmatched markers are appended
+        at the end with ``source="video_markers"``.
+
+        If no HTML items were found, markers are returned as-is (the
+        fallback behaviour from before).
+        """
+        if not html_items:
+            return marker_items
+        if not marker_items:
+            return html_items
+
+        # Build a lookup of normalised marker titles → marker item.
+        # A marker can only be claimed once.
+        available: dict[int, dict] = {i: m for i, m in enumerate(marker_items)}
+        normalised_markers: list[tuple[int, str]] = [
+            (i, self._normalise_for_match(m["title"]))
+            for i, m in enumerate(marker_items)
+        ]
+
+        matched_marker_ids: set[int] = set()
+
+        for item in html_items:
+            norm_title = self._normalise_for_match(item["title"])
+            best_idx: int | None = None
+            best_score: float = 0.0
+
+            for midx, mnorm in normalised_markers:
+                if midx in matched_marker_ids:
+                    continue
+                score = self._title_similarity(norm_title, mnorm)
+                if score > best_score:
+                    best_score = score
+                    best_idx = midx
+
+            if best_idx is not None and best_score >= 0.6:
+                matched_marker_ids.add(best_idx)
+                marker = available[best_idx]
+                # Copy timestamp from the marker if the HTML item lacks one.
+                if marker.get("media_ref") and not item.get("media_ref"):
+                    item["media_ref"] = marker["media_ref"]
+
+        # Append unmatched markers (procedural items like votes, roll calls
+        # that only appear in the video but not on the published agenda).
+        for midx, marker in available.items():
+            if midx not in matched_marker_ids:
+                html_items.append(marker)
+
+        return html_items
+
+    @staticmethod
+    def _normalise_for_match(title: str) -> str:
+        """Normalise a title for fuzzy matching between sources."""
+        t = title.lower().strip()
+        # Strip leading order numbers ("1.", "A.", "IV.")
+        t = re.sub(r"^(?:\d+[a-z]?[\.\)]\s*|[a-z][\.\)]\s*|[ivxlc]+[\.\)]\s*)", "", t)
+        # Collapse whitespace
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    @staticmethod
+    def _title_similarity(a: str, b: str) -> float:
+        """Compute similarity between two normalised titles.
+
+        Returns a float in [0, 1].  Uses containment and word overlap
+        to handle the common case where one title is a prefix/subset
+        of the other.
+        """
+        if not a or not b:
+            return 0.0
+        if a == b:
+            return 1.0
+        # One contains the other (e.g. marker has full title, HTML has truncated)
+        if a in b or b in a:
+            return 0.9
+
+        # Word-level overlap (Jaccard-like)
+        words_a = set(a.split())
+        words_b = set(b.split())
+        if not words_a or not words_b:
+            return 0.0
+        intersection = words_a & words_b
+        union = words_a | words_b
+        return len(intersection) / len(union)
 
     def _scrape_agenda_json(self, clip_id: int) -> list[dict]:
         """Fetch agenda items from the ``JSON.php`` endpoint.
@@ -919,6 +1028,8 @@ class GranicusScraper(BaseScraper):
             item: dict = {"title": title, "source": "agenda_page"}
             if marker.get("order"):
                 item["order"] = marker["order"]
+            if marker.get("level") is not None:
+                item["level"] = marker["level"]
             item["classification"] = self._classify_item(title)
 
             # Video timestamp from the Agenda link
@@ -947,12 +1058,47 @@ class GranicusScraper(BaseScraper):
 
         # Supplement: find numbered items in per-item tables that don't
         # have Agenda-class links (e.g. Sacramento consent calendar items).
+        # Insert them right after the "Consent Calendar" section header
+        # (or similar section) so the ordering reflects the real agenda.
         supplemental = self._find_numbered_table_items(soup, view_id, clip_id)
         if supplemental:
             existing = {it["title"] for it in items}
+            new_items = [s for s in supplemental if s["title"] not in existing]
+            if new_items:
+                # Find the best insertion point: after a section header
+                # whose title contains "consent" (case-insensitive).
+                insert_idx = len(items)
+                for idx, it in enumerate(items):
+                    if (
+                        it.get("level") == 0
+                        and "consent" in it["title"].lower()
+                    ):
+                        # Insert after this section header, but before the
+                        # next L0 section.
+                        insert_idx = idx + 1
+                        for j in range(idx + 1, len(items)):
+                            if items[j].get("level") == 0:
+                                insert_idx = j
+                                break
+                        break
+                for i, supp in enumerate(new_items):
+                    items.insert(insert_idx + i, supp)
+
+            # Deduplicate: if a section header captured docs that now
+            # belong to individual sub-items, remove them from the header.
+            child_doc_urls: set[str] = set()
             for supp in supplemental:
-                if supp["title"] not in existing:
-                    items.append(supp)
+                for doc in supp.get("documents", []):
+                    child_doc_urls.add(doc.get("url", ""))
+            if child_doc_urls:
+                for it in items:
+                    if it.get("documents") and it.get("level") == 0:
+                        it["documents"] = [
+                            d for d in it["documents"]
+                            if d.get("url", "") not in child_doc_urls
+                        ]
+                        if not it["documents"]:
+                            del it["documents"]
 
         return items
 
@@ -1014,11 +1160,36 @@ class GranicusScraper(BaseScraper):
                 "title": title,
                 "order": order,
                 "source": "agenda_page",
+                "level": 1,  # numbered items are sub-items (within consent section)
                 "classification": self._classify_item(title),
             }
 
-            # Find associated documents after this table
-            docs = self._extract_documents_near(title_strong, view_id, clip_id)
+            # Find documents between this table and the next one.
+            # Each numbered item table is followed by a <blockquote>
+            # with its Document links, then the next table starts.
+            docs: list[dict] = []
+            seen_urls: set[str] = set()
+            for tag in table.find_all_next(["a", "table"]):
+                if tag.name == "table" and tag is not table:
+                    break  # Reached the next numbered item
+                if tag.name != "a":
+                    continue
+                classes = " ".join(tag.get("class") or [])
+                if "Document" not in classes:
+                    continue
+                href = tag.get("href", "")
+                if "MetaViewer" not in href:
+                    continue
+                full_url = urljoin(self.site.base_url + "/", href)
+                if full_url in seen_urls:
+                    continue
+                seen_urls.add(full_url)
+                text = tag.get_text(strip=True) or "Attachment"
+                docs.append({
+                    "title": text,
+                    "url": full_url,
+                    "type": self._classify_document(text),
+                })
             if docs:
                 item["documents"] = docs
 
@@ -1054,12 +1225,20 @@ class GranicusScraper(BaseScraper):
                 meta_id = re.search(r"\d+", name).group() if re.search(r"\d+", name) else None
                 order, clean_title = self._split_order_prefix(title)
 
+                # Extract hierarchy level from CSS classes:
+                # Agenda0 = section, Agenda1 = item, Agenda2 = sub-item.
+                level: int | None = None
+                level_m = re.search(r"\bAgenda(\d+)\b", classes)
+                if level_m:
+                    level = int(level_m.group(1))
+
                 markers.append({
                     "title": clean_title or title,
                     "order": order,
                     "meta_id": meta_id,
                     "href": el.get("href", ""),
                     "element": el,
+                    "level": level,
                 })
 
             elif el.name in ("h2", "h3"):
@@ -1102,6 +1281,7 @@ class GranicusScraper(BaseScraper):
                     "meta_id": None,
                     "href": "",
                     "element": el,
+                    "level": 0,  # bold+underline = section header
                 })
 
         return markers
@@ -1150,7 +1330,10 @@ class GranicusScraper(BaseScraper):
                 continue
             seen.add(title)
 
-            item: dict = {"title": title, "source": "agenda_page"}
+            # Heading level: h2 = section (0), h3 = item (1)
+            level = 0 if heading.name == "h2" else 1
+
+            item: dict = {"title": title, "source": "agenda_page", "level": level}
             if order_text:
                 item["order"] = order_text
             item["classification"] = self._classify_item(title)
