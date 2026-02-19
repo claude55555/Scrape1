@@ -11,10 +11,23 @@ scrapers/
   base.py                       # Base class all scrapers inherit from
   example/scraper.py            # Annotated example — copy this to start a new scraper
   granicus/                     # Granicus Classic platform scraper
-    scraper.py                  #   Core scraper (ViewPublisher, AgendaViewer, player)
+    scraper.py                  #   Orchestrator (list meetings → scrape each → output)
+    extraction.py               #   Shared helpers (doc/body/timestamp/classification)
+    discovery.py                #   ViewPublisher/RSS meeting listing
+    media.py                    #   Video, captions, index-point extraction
+    merge.py                    #   HTML + JSON agenda merging
     sites.py                    #   Known city configurations
     __main__.py                 #   CLI entry point
+    ARCHITECTURE.md             #   Developer guide — how to add a new city
+    parsers/                    #   Pluggable agenda page parsers
+      base.py                   #     AgendaParser ABC + ParseContext
+      css_classes.py            #     Sacramento-style (Agenda0/1/2 CSS classes)
+      headings.py               #     Shoreline-style (h2/h3 headings)
+      bold.py                   #     Generic bold-text fallback
+      table.py                  #     Generic table-row fallback
+      flat.py                   #     Last-resort numbered-line fallback
 validate.py                     # CLI tool to validate output files
+fixtures/                       # Saved HTML pages for offline testing
 ```
 
 ## Quick start
@@ -86,12 +99,19 @@ python -m scrapers.granicus --all --start-date 2025-06-01 -v
 Add more in `scrapers/granicus/sites.py`.
 
 **How it works:**
-1. Scrapes `ViewPublisher.php` to discover all archived meeting clips for each body
-2. For each clip, fetches `GeneratedAgendaViewer.php` to get structured agenda items,
-   document links, and video timestamps
-3. Fetches the `/player/clip/{id}` page to extract video stream URLs and duration
-4. Checks `MinutesViewer.php` for approved minutes documents
-5. Assembles everything into one Open Civic Agenda JSON file per meeting
+1. **Discovery** (`discovery.py`): Scrapes `ViewPublisher.php` / RSS to list all archived clips
+2. **Agenda parsing** (`parsers/`): Fetches `GeneratedAgendaViewer.php` and auto-detects the
+   correct parser for the page's HTML structure (CSS classes, headings, bold text, etc.)
+3. **Video markers** (`media.py`): Fetches `JSON.php` for timestamped agenda markers
+4. **Merge** (`merge.py`): Combines HTML agenda items with video markers via fuzzy title matching
+5. **Media** (`media.py`): Fetches `/player/clip/{id}` for video URL, duration, captions
+6. **Minutes** (`media.py`): Checks `MinutesViewer.php` for approved minutes documents
+7. **Assembly** (`scraper.py`): Combines everything into one Open Civic Agenda JSON per meeting
+
+**Adding a new city:**
+If its Granicus HTML matches an existing pattern, just add a `GranicusSite` to `sites.py`.
+If it has a new HTML layout, add a small parser class (~80 lines) in `parsers/`.
+See [`scrapers/granicus/ARCHITECTURE.md`](scrapers/granicus/ARCHITECTURE.md) for the full guide.
 
 ## Validating output
 
