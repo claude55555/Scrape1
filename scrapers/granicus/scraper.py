@@ -323,9 +323,13 @@ class GranicusScraper(BaseScraper):
         Primary strategy: RSS feed (``ViewPublisherRSS.php``), which
         provides structured data with unambiguous date-to-clip mapping.
 
-        Fallback: HTML scraping of ``ViewPublisher.php``, iterating table
-        rows top-to-bottom with date-header tracking and clip_id
-        cross-validation.
+        Fallback: HTML scraping of ``ViewPublisher.php``.
+
+        Real Granicus HTML uses ``table.listingTable`` with ``<thead>``
+        and ``<tbody>``.  Each archive row contains its own Date cell —
+        there are **no** separate date-header rows.  The video link's
+        ``href`` is ``javascript:void(0)``; the real clip URL lives
+        inside the ``onclick`` attribute.
         """
         # --- Primary: RSS feed ---
         refs = self._parse_view_publisher_rss(view_id, body_name)
@@ -337,60 +341,111 @@ class GranicusScraper(BaseScraper):
         url = self._url("ViewPublisher.php", view_id=view_id)
         soup = self._soup(url)
 
-        table = self._find_meeting_table(soup)
-        if table is None:
-            return self._parse_view_publisher_divs(soup, view_id, body_name)
-
-        player_re = re.compile(
-            r"(player/clip/\d+|MediaPlayer\.php\?.*clip_id=\d+)"
-        )
-
         refs: list[ClipRef] = []
         seen_clip_ids: set[int] = set()
-        current_date = ""
 
-        # Only iterate direct child rows of the table (via <tbody> if
-        # present) so we never accidentally process rows that live inside
-        # nested formatting tables within a cell.
-        row_parent = table.find("tbody") or table
-        for row in row_parent.find_all("tr", recursive=False):
-            row_text = row.get_text(" ", strip=True)
-            row_date = self._extract_date_from_text(row_text)
+        # Real pages have multiple table.listingTable (one per year tab).
+        tables = soup.find_all("table", class_="listingTable")
+        if not tables:
+            # Legacy: try finding the innermost table with clip links.
+            table = self._find_meeting_table(soup)
+            if table:
+                tables = [table]
 
-            player_link = row.find("a", href=player_re)
+        for table in tables:
+            tbody = table.find("tbody") or table
+            for row in tbody.find_all("tr", recursive=False):
+                clip_id = self._extract_clip_id_from_row(row)
+                if clip_id is None or clip_id in seen_clip_ids:
+                    continue
+                seen_clip_ids.add(clip_id)
 
-            # Date-only header row — update running date, but only when
-            # the row is short (just a date, not a paragraph that happens
-            # to contain one).
-            if row_date and not player_link:
-                if len(row_text) < len(row_date) + 30:
-                    current_date = row_date
-                continue
+                # Date is in this row's own Date cell, not a header row.
+                date_str = self._extract_date_from_row(row)
 
-            if not player_link:
-                continue
+                # Agenda / minutes links from sibling cells.
+                agenda_url = None
+                minutes_url = None
+                for link in row.find_all("a", href=True):
+                    href = link["href"]
+                    if not agenda_url and (
+                        "AgendaViewer" in href
+                        or "GeneratedAgendaViewer" in href
+                    ):
+                        link_clip = self._extract_clip_id(href)
+                        if link_clip is None or link_clip == clip_id:
+                            agenda_url = urljoin(self.site.base_url + "/", href)
+                    elif not minutes_url and "MinutesViewer" in href:
+                        link_clip = self._extract_clip_id(href)
+                        if link_clip is None or link_clip == clip_id:
+                            minutes_url = urljoin(self.site.base_url + "/", href)
 
-            clip_id = self._extract_clip_id(player_link["href"])
-            if clip_id is None or clip_id in seen_clip_ids:
-                continue
-            seen_clip_ids.add(clip_id)
-
-            ref = ClipRef(
-                clip_id=clip_id,
-                view_id=view_id,
-                title=body_name,
-                video_url=urljoin(self.site.base_url + "/", player_link["href"]),
-                date=row_date or current_date,
-            )
-
-            self._find_sibling_links(row, ref, view_id)
-            refs.append(ref)
+                ref = ClipRef(
+                    clip_id=clip_id,
+                    view_id=view_id,
+                    title=body_name,
+                    date=date_str,
+                    video_url=(
+                        f"{self.site.base_url}/MediaPlayer.php"
+                        f"?view_id={view_id}&clip_id={clip_id}"
+                    ),
+                    agenda_url=agenda_url,
+                    minutes_url=minutes_url,
+                )
+                refs.append(ref)
 
         # Fallback: some ViewPublisher pages use divs instead of tables.
         if not refs:
             refs = self._parse_view_publisher_divs(soup, view_id, body_name)
 
         return refs
+
+    @staticmethod
+    def _extract_clip_id_from_row(row: Tag) -> int | None:
+        """Extract clip_id from any link in a table row.
+
+        Real Granicus pages put the clip URL inside an ``onclick``
+        handler (``window.open('...MediaPlayer.php?...clip_id=N', ...)``),
+        with the ``href`` set to ``javascript:void(0)``.  We check both
+        ``onclick`` and ``href``.
+        """
+        for link in row.find_all("a"):
+            # Check onclick first (most common in real Granicus HTML).
+            onclick = link.get("onclick") or ""
+            if onclick:
+                m = re.search(r"clip_id=(\d+)", onclick)
+                if m:
+                    return int(m.group(1))
+
+            # Also check href for direct links.
+            href = link.get("href") or ""
+            m = re.search(r"(?:player/clip/|clip_id=)(\d+)", href)
+            if m:
+                return int(m.group(1))
+
+        return None
+
+    @staticmethod
+    def _extract_date_from_row(row: Tag) -> str:
+        """Extract the date from a ViewPublisher table row.
+
+        Real Granicus pages put the date in a cell whose ``headers``
+        attribute contains ``"Date"`` or whose ``class`` contains
+        ``"Date"``.  The cell text looks like ``Jan 15, 2026 - 06:00 PM``
+        (with ``&nbsp;`` entities).
+        """
+        for cell in row.find_all("td"):
+            headers = cell.get("headers") or ""
+            classes = " ".join(cell.get("class") or [])
+            if "Date" in headers or "Date" in classes:
+                text = cell.get_text(" ", strip=True)
+                m = _DATE_RE.search(text)
+                return m.group(1).strip() if m else ""
+
+        # Fallback: search the full row text.
+        text = row.get_text(" ", strip=True)
+        m = _DATE_RE.search(text)
+        return m.group(1).strip() if m else ""
 
     def _parse_view_publisher_rss(self, view_id: int, body_name: str) -> list[ClipRef]:
         """Parse meeting listings from the ViewPublisher RSS feed.
@@ -619,8 +674,10 @@ class GranicusScraper(BaseScraper):
         # Scrape agenda items (also returns a date extracted from the page header)
         agenda_items = []
         agenda_docs = []
+        # Try the URL from the listing page first; fall back to both
+        # AgendaViewer.php and GeneratedAgendaViewer.php since sites vary.
         actual_agenda_url = agenda_url or self._url(
-            "GeneratedAgendaViewer.php", view_id=view_id, clip_id=clip_id
+            "AgendaViewer.php", view_id=view_id, clip_id=clip_id
         )
         agenda_items, agenda_docs, agenda_date = self._scrape_agenda(
             actual_agenda_url, view_id, clip_id
@@ -636,8 +693,14 @@ class GranicusScraper(BaseScraper):
         if not start_date:
             start_date = raw_date or "unknown"
 
-        # Scrape video metadata from the player page
-        media = self._scrape_media(clip_id, view_id)
+        # Scrape video metadata from the player page (also extracts
+        # index-point agenda items as a fallback).
+        media, index_items = self._scrape_media(clip_id, view_id)
+
+        # Use player index points if agenda parsing produced nothing
+        if not agenda_items and index_items:
+            logger.info("  Using %d index points from player page as agenda", len(index_items))
+            agenda_items = index_items
 
         # Scrape minutes if available
         minutes_doc = None
@@ -735,37 +798,30 @@ class GranicusScraper(BaseScraper):
             page_date = self._extract_date_from_page(soup)
 
             if not items:
-                # Try HTML-based agenda parsers
-                items = self._parse_agenda_bold(soup, view_id, clip_id)
+                # Strategy 1: Granicus CSS-class markers
+                # (class="Agenda Agenda0/1/2" links — Sacramento pattern)
+                items = self._parse_agenda_granicus_classes(soup, view_id, clip_id)
 
+                # Strategy 2: Heading-based items
+                # (<h2>/<h3> with span-based numbers — Shoreline pattern)
+                if not items:
+                    items = self._parse_agenda_headings(soup, view_id, clip_id)
+
+                # Strategy 3: Bold text
+                if not items:
+                    items = self._parse_agenda_bold(soup, view_id, clip_id)
+
+                # Strategy 4: structured table
                 if not items:
                     items = self._parse_agenda_table(soup, view_id, clip_id)
 
-                if not items:
-                    agenda_container = (
-                        soup.find("div", class_=re.compile(r"agenda", re.I))
-                        or soup.find("div", id=re.compile(r"agenda", re.I))
-                        or soup.find("div", id="recorddetail_content")
-                        or soup.find("div", class_="recorddetail")
-                    )
-                    if agenda_container:
-                        items = self._parse_agenda_container(
-                            agenda_container, view_id, clip_id
-                        )
-
+                # Strategy 5: flat numbered-text parse
                 if not items:
                     items = self._parse_agenda_flat(soup, view_id, clip_id)
 
-            # Look for meeting-level agenda PDF links (always, regardless
-            # of which strategy produced agenda items)
-            for link in soup.find_all("a", href=re.compile(r"MetaViewer\.php")):
-                text = link.get_text(strip=True).lower()
-                if "full agenda" in text or "agenda packet" in text or "meeting packet" in text:
-                    meeting_docs.append({
-                        "title": link.get_text(strip=True),
-                        "url": urljoin(self.site.base_url + "/", link["href"]),
-                        "type": "agenda" if "agenda" in text else "packet",
-                    })
+            # Extract meeting-level documents using class="Document"
+            # selectors (reliable across Granicus sites).
+            meeting_docs = self._extract_meeting_level_docs(soup)
 
         return items, meeting_docs, page_date
 
@@ -828,6 +884,345 @@ class GranicusScraper(BaseScraper):
             items.append(item)
 
         return items
+
+    def _parse_agenda_granicus_classes(
+        self, soup: BeautifulSoup, view_id: int, clip_id: int
+    ) -> list[dict]:
+        """Parse agenda items using Granicus CSS class markers.
+
+        Sacramento-style pages mark agenda items with
+        ``class="Agenda Agenda0/1/2"`` links and documents with
+        ``class="Document Document1/2"`` links.  The ``Agenda`` class
+        level indicates nesting depth (0 = section, 1 = item, 2 = sub).
+        """
+        agenda_links = soup.find_all(
+            "a", class_=re.compile(r"\bAgenda\b")
+        )
+        if not agenda_links:
+            return []
+
+        items: list[dict] = []
+        seen: set[str] = set()
+
+        # Also collect standalone bold/underlined section headers that
+        # have NO anchor link (e.g. "Land Acknowledgement").
+        # We interleave them by document order.
+        all_markers = self._collect_agenda_markers(soup, agenda_links)
+
+        for marker in all_markers:
+            title = marker["title"]
+            if title in seen or not title or len(title) < 3:
+                continue
+            seen.add(title)
+
+            item: dict = {"title": title}
+            if marker.get("order"):
+                item["order"] = marker["order"]
+            item["classification"] = self._classify_item(title)
+
+            # Video timestamp from the Agenda link
+            if marker.get("meta_id"):
+                item["media_ref"] = {"media_id": f"clip-{clip_id}"}
+                href = marker.get("href", "")
+                offset = (
+                    self._extract_param(href, "entrytime")
+                    or self._extract_param(href, "starttime")
+                )
+                if offset:
+                    try:
+                        item["media_ref"]["offset_seconds"] = int(float(offset))
+                    except ValueError:
+                        pass
+
+            # Collect documents from following siblings until next Agenda marker
+            if marker.get("element"):
+                docs = self._extract_documents_near(
+                    marker["element"], view_id, clip_id
+                )
+                if docs:
+                    item["documents"] = docs
+
+            items.append(item)
+
+        return items
+
+    def _collect_agenda_markers(
+        self, soup: BeautifulSoup, agenda_links: list[Tag]
+    ) -> list[dict]:
+        """Build an ordered list of agenda markers from class="Agenda" links
+        and plain bold/underlined section headers."""
+        # Index agenda links by their name attribute for fast lookup.
+        agenda_names = {a.get("name") for a in agenda_links if a.get("name")}
+
+        markers: list[dict] = []
+        seen_names: set[str] = set()
+
+        # Walk through the document collecting both linked and unlinked items.
+        # Linked items: <a class="Agenda Agenda0/1/2" name="agendaNNN">
+        # Unlinked items: <strong><u>Section Title</u></strong> (no anchor)
+        for el in soup.find_all(["a", "strong", "b", "h2", "h3"]):
+            if el.name == "a":
+                classes = " ".join(el.get("class") or [])
+                if "Agenda" not in classes:
+                    continue
+                name = el.get("name", "")
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+
+                title = el.get_text(strip=True)
+                meta_id = re.search(r"\d+", name).group() if re.search(r"\d+", name) else None
+                order, clean_title = self._split_order_prefix(title)
+
+                markers.append({
+                    "title": clean_title or title,
+                    "order": order,
+                    "meta_id": meta_id,
+                    "href": el.get("href", ""),
+                    "element": el,
+                })
+
+            elif el.name in ("h2", "h3"):
+                # Shoreline-style: <h2><span>1.&nbsp;</span><span>TITLE</span></h2>
+                # Handle this in _parse_agenda_headings instead.
+                continue
+
+            else:
+                # <strong> or <b> — only if it wraps a <u> child and
+                # does NOT contain an Agenda-class anchor (those are
+                # captured separately via the <a> branch above).
+                u_child = el.find("u")
+                if not u_child:
+                    continue
+                # Skip if this bold element CONTAINS an Agenda-class link
+                if el.find("a", class_=re.compile(r"\bAgenda\b")):
+                    continue
+                title = u_child.get_text(strip=True)
+                if not title or len(title) < 3:
+                    continue
+                # Skip centered header chrome
+                if self._is_centered(el):
+                    continue
+                # Skip date-like text
+                date_m = _DATE_RE.search(title)
+                if date_m and len(title) < len(date_m.group(1)) + 20:
+                    continue
+                # Skip document-header labels ("Print Meeting Agenda")
+                title_lower = title.lower()
+                if title_lower.startswith("print "):
+                    continue
+                # Skip amendment notices
+                if title_lower.startswith(("supplemental material", "amended material")):
+                    continue
+
+                order, clean_title = self._split_order_prefix(title)
+                markers.append({
+                    "title": clean_title or title,
+                    "order": order,
+                    "meta_id": None,
+                    "href": "",
+                    "element": el,
+                })
+
+        return markers
+
+    def _parse_agenda_headings(
+        self, soup: BeautifulSoup, view_id: int, clip_id: int
+    ) -> list[dict]:
+        """Parse agenda items from ``<h2>``/``<h3>`` headings.
+
+        Shoreline-style pages use headings with float-based spans::
+
+            <h2><span>1.&nbsp;</span><span>CALL TO ORDER</span></h2>
+            <h3><span>A.&nbsp;</span><span>Sub-item title</span></h3>
+
+        Returns items with documents extracted from following ``class="Document"``
+        links.
+        """
+        headings = soup.find_all(["h2", "h3"])
+        if not headings:
+            return []
+
+        items: list[dict] = []
+        seen: set[str] = set()
+
+        for heading in headings:
+            spans = heading.find_all("span", recursive=False)
+            if len(spans) >= 2:
+                # Structured heading: first span = number, second span = title
+                order_text = spans[0].get_text(strip=True).rstrip(".\xa0 ")
+                title = spans[1].get_text(strip=True)
+            else:
+                # Plain heading text
+                title = heading.get_text(strip=True)
+                order_text = None
+                order_m = re.match(
+                    r"^(\d+[a-z]?[\.\)]?|[A-Z][\.\)]?)\s+(.+)", title
+                )
+                if order_m:
+                    order_text = order_m.group(1).rstrip(".)")
+                    title = order_m.group(2).strip()
+
+            if not title or len(title) < 3 or title in seen:
+                continue
+            # Skip navigation / chrome
+            if title.lower() in ("links", "footer", "header", ""):
+                continue
+            seen.add(title)
+
+            item: dict = {"title": title}
+            if order_text:
+                item["order"] = order_text
+            item["classification"] = self._classify_item(title)
+
+            # Documents follow the heading in blockquotes with class="Document" links
+            docs = self._extract_documents_near(heading, view_id, clip_id)
+            if docs:
+                item["documents"] = docs
+
+            items.append(item)
+
+        return items
+
+    def _extract_documents_near(
+        self, element: Tag, view_id: int, clip_id: int
+    ) -> list[dict]:
+        """Extract ``class="Document"`` links near an agenda item element.
+
+        Walks forward through the document from *element* collecting
+        ``Document``-class links until the next agenda marker (another
+        ``Agenda``-class link, an ``<h2>/<h3>`` heading, or a bold
+        section header).  This approach is layout-agnostic and works
+        regardless of how deeply the element is nested.
+        """
+        docs: list[dict] = []
+        seen_urls: set[str] = set()
+
+        # Walk forward through <a>, <h2>, <h3>, and <strong> elements
+        # in document order — stop at the next agenda marker or heading.
+        for tag in element.find_all_next(["a", "h2", "h3", "strong"]):
+            # Stop at the next heading (Shoreline pattern).
+            if tag.name in ("h2", "h3") and tag is not element:
+                break
+
+            # Stop at bold+underline section headers (Sacramento pattern).
+            if tag.name == "strong" and tag.find("u"):
+                if tag.find("a", class_=re.compile(r"\bAgenda\b")):
+                    break  # Contains next Agenda-class link
+                if not self._is_centered(tag):
+                    break  # Standalone bold section header
+
+            if tag.name != "a":
+                continue
+
+            classes = " ".join(tag.get("class") or [])
+
+            # Stop at the next Agenda-class link.
+            if "Agenda" in classes and "Document" not in classes:
+                break
+
+            if "Document" not in classes:
+                continue
+            href = tag.get("href", "")
+            if "MetaViewer" not in href:
+                continue
+            full_url = urljoin(self.site.base_url + "/", href)
+            if full_url in seen_urls:
+                continue
+            seen_urls.add(full_url)
+            text = tag.get_text(strip=True) or "Attachment"
+            docs.append({
+                "title": text,
+                "url": full_url,
+                "type": self._classify_document(text),
+            })
+
+        return docs
+
+    def _extract_meeting_level_docs(self, soup: BeautifulSoup) -> list[dict]:
+        """Extract meeting-level documents from ``class="Document Document0/1"`` links.
+
+        ``Document0`` and ``Document1`` with keywords like "Print Meeting",
+        "Agenda", "Packet", or "PDF Packet" are meeting-level documents.
+        """
+        meeting_docs: list[dict] = []
+        seen_urls: set[str] = set()
+
+        for link in soup.find_all("a", class_=re.compile(r"\bDocument\b")):
+            href = link.get("href", "")
+            if "MetaViewer" not in href:
+                continue
+            text = link.get_text(strip=True)
+            text_lower = text.lower()
+
+            # Meeting-level: "Print Meeting Agenda", "City Council PDF Packet",
+            # "Agenda - 12/08/2025", "Full Agenda", etc.
+            classes = " ".join(link.get("class") or [])
+            is_doc0_or_1 = "Document0" in classes or "Document1" in classes
+            is_meeting_level = any(
+                kw in text_lower for kw in (
+                    "print meeting", "pdf packet", "full agenda",
+                    "agenda packet", "meeting packet",
+                )
+            )
+            if is_doc0_or_1 and is_meeting_level:
+                full_url = urljoin(self.site.base_url + "/", href)
+                if full_url not in seen_urls:
+                    seen_urls.add(full_url)
+                    meeting_docs.append({
+                        "title": text,
+                        "url": full_url,
+                        "type": "agenda" if "agenda" in text_lower else "packet",
+                    })
+
+        # Fallback: check for MetaViewer links with keyword in text
+        if not meeting_docs:
+            for link in soup.find_all("a", href=re.compile(r"MetaViewer\.php")):
+                text = link.get_text(strip=True).lower()
+                if "full agenda" in text or "agenda packet" in text or "meeting packet" in text:
+                    full_url = urljoin(self.site.base_url + "/", link["href"])
+                    if full_url not in seen_urls:
+                        seen_urls.add(full_url)
+                        meeting_docs.append({
+                            "title": link.get_text(strip=True),
+                            "url": full_url,
+                            "type": "agenda" if "agenda" in text else "packet",
+                        })
+
+        return meeting_docs
+
+    @staticmethod
+    def _split_order_prefix(text: str) -> tuple[str | None, str]:
+        """Split a leading order number/letter from agenda item text.
+
+        Returns (order, remaining_text).  If no prefix is found, returns
+        (None, original_text).
+        """
+        m = re.match(r"^(\d+[a-z]?[\.\)]?)\s*\.?\s+(.+)", text, re.DOTALL)
+        if m:
+            return m.group(1).rstrip(".)"), m.group(2).strip()
+        m = re.match(r"^([A-Z]{1,5}[\.\)]|[IVXLC]+[\.\)])\s+(.+)", text)
+        if m:
+            return m.group(1).rstrip(".)"), m.group(2).strip()
+        return None, text
+
+    @staticmethod
+    def _classify_document(text: str) -> str:
+        """Classify a document by its link text."""
+        t = text.lower()
+        if "staff report" in t:
+            return "staff_report"
+        if "ordinance" in t:
+            return "ordinance"
+        if "resolution" in t:
+            return "resolution"
+        if "agenda" in t:
+            return "agenda"
+        if "minutes" in t:
+            return "minutes"
+        if "presentation" in t:
+            return "presentation"
+        return "attachment"
 
     def _extract_date_from_page(self, soup: BeautifulSoup) -> str | None:
         """Try to extract a date from the page title, headers, or body text."""
@@ -1263,22 +1658,22 @@ class GranicusScraper(BaseScraper):
     # Phase 2b: Scrape video/media from the player page
     # ------------------------------------------------------------------
 
-    def _scrape_media(self, clip_id: int, view_id: int) -> list[dict]:
-        """Scrape video metadata from the player page.
+    def _scrape_media(
+        self, clip_id: int, view_id: int
+    ) -> tuple[list[dict], list[dict]]:
+        """Scrape video metadata and index points from the player page.
 
-        The player page at /player/clip/{id} is an HTML5 video player.
-        The actual video stream URL is typically an HLS (m3u8) URL served
-        from archive-stream.granicus.com. We look for it in:
-        - <video> or <source> tags
-        - JavaScript variables / JSON config in <script> blocks
-        - og:video meta tags
+        Returns ``(media_entries, index_items)``.  ``index_items`` are
+        agenda items extracted from the player page's ``<div class="index-point">``
+        elements, each with a video timestamp — useful as a fallback when
+        the agenda page parsing fails.
         """
         url = self._url(f"player/clip/{clip_id}", view_id=view_id)
         try:
             soup = self._soup(url)
         except requests.RequestException as e:
             logger.warning("Could not fetch player page for clip %d: %s", clip_id, e)
-            return []
+            return [], []
 
         video_url = None
         duration = None
@@ -1303,15 +1698,14 @@ class GranicusScraper(BaseScraper):
                 video_url = og_video.get("content", "")
 
         # Method 4: Search script blocks for stream URLs
+        # (includes video_url="..." global variable pattern)
         if not video_url:
             for script in soup.find_all("script"):
                 text = script.string or ""
-                # Look for m3u8 URLs
-                m3u8_match = re.search(r'"(https?://[^"]+\.m3u8[^"]*)"', text)
+                m3u8_match = re.search(r'["\']?(https?://[^"\']+\.m3u8[^"\']*)["\']?', text)
                 if m3u8_match:
                     video_url = m3u8_match.group(1)
                     break
-                # Look for mp4 URLs
                 mp4_match = re.search(r'"(https?://[^"]+\.mp4[^"]*)"', text)
                 if mp4_match:
                     video_url = mp4_match.group(1)
@@ -1325,7 +1719,6 @@ class GranicusScraper(BaseScraper):
                 duration = int(dur_match.group(1))
                 break
 
-        # Also check for og:video:duration
         if not duration:
             og_dur = soup.find("meta", property="og:video:duration")
             if og_dur:
@@ -1334,7 +1727,7 @@ class GranicusScraper(BaseScraper):
                 except (ValueError, KeyError):
                     pass
 
-        # Build the media entry — always include the player page URL as fallback
+        # Build the media entry
         player_url = f"{self.site.base_url}/player/clip/{clip_id}?view_id={view_id}"
         media_entry = {
             "id": f"clip-{clip_id}",
@@ -1343,7 +1736,6 @@ class GranicusScraper(BaseScraper):
             "label": "Granicus recording",
         }
 
-        # If we found a stream URL, also include the player page as a secondary ref
         if video_url:
             media_entry["media_type"] = (
                 "application/x-mpegURL" if "m3u8" in video_url else "video/mp4"
@@ -1352,7 +1744,50 @@ class GranicusScraper(BaseScraper):
         if duration:
             media_entry["duration_seconds"] = duration
 
-        return [media_entry]
+        # --- Extract index points (agenda items with timestamps) ---
+        index_items = self._extract_index_points(soup, clip_id)
+
+        return [media_entry], index_items
+
+    def _extract_index_points(
+        self, soup: BeautifulSoup, clip_id: int
+    ) -> list[dict]:
+        """Extract agenda items from player page index points.
+
+        The player page has ``<div class="index-point" time="N">`` elements
+        that represent agenda items with precise video timestamps.
+        """
+        items: list[dict] = []
+        order_num = 0
+
+        for div in soup.find_all("div", class_="index-point"):
+            title = div.get_text(strip=True)
+            if not title or len(title) < 3:
+                continue
+
+            order_num += 1
+            order, clean_title = self._split_order_prefix(title)
+
+            item: dict = {
+                "title": clean_title or title,
+                "order": order or str(order_num),
+                "classification": self._classify_item(clean_title or title),
+            }
+
+            # Video timestamp from the time attribute
+            time_attr = div.get("time")
+            if time_attr is not None:
+                try:
+                    item["media_ref"] = {
+                        "media_id": f"clip-{clip_id}",
+                        "offset_seconds": int(float(time_attr)),
+                    }
+                except (ValueError, TypeError):
+                    pass
+
+            items.append(item)
+
+        return items
 
     # ------------------------------------------------------------------
     # Phase 2c: Scrape minutes
