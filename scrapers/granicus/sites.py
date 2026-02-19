@@ -8,6 +8,10 @@ To add a new site:
     2. Visit {subdomain}.granicus.com/ViewPublisher.php?view_id=1 and increment
        view_id to discover which bodies have content.
     3. Add a GranicusSite entry below.
+    4. Optionally set ``parser_hints`` to the name of the agenda parser
+       that best matches the site's HTML structure.  Available parsers:
+       ``css_classes``, ``headings``, ``bold``, ``table``, ``flat``.
+       If omitted, the scraper auto-detects the right parser.
 """
 
 from scrapers.granicus.scraper import GranicusSite
@@ -44,6 +48,7 @@ SACRAMENTO_CA = GranicusSite(
     views={
         21: "City Council",
     },
+    parser_hints=["css_classes"],
 )
 
 # ── Washington ────────────────────────────────────────────────────────
@@ -66,6 +71,7 @@ SHORELINE_WA = GranicusSite(
     views={
         1: "City Council",
     },
+    parser_hints=["headings"],
 )
 
 # ── Registry ──────────────────────────────────────────────────────────
