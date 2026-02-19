@@ -263,6 +263,69 @@ def extract_media_ref(el: Tag, clip_id: int) -> dict | None:
 
 
 # ------------------------------------------------------------------
+# HTML → lightweight markdown conversion
+# ------------------------------------------------------------------
+
+def _html_to_markdown(element: Tag) -> str:
+    """Convert an HTML element to lightweight markdown.
+
+    Preserves:
+    - **bold** from ``<strong>``/``<b>``
+    - *italic* from ``<em>``/``<i>``
+    - [link text](url) from ``<a href>``
+    - Line breaks from ``<br>``
+
+    Strips all other tags but keeps their text content.
+    """
+    parts: list[str] = []
+
+    for child in element.children:
+        if isinstance(child, str):
+            # Plain text node — collapse internal whitespace but keep it
+            text = re.sub(r"[ \t]+", " ", child)
+            parts.append(text)
+            continue
+
+        if not isinstance(child, Tag):
+            continue
+
+        if child.name == "br":
+            parts.append("\n")
+            continue
+
+        # Recurse into the child to handle nested markup
+        inner = _html_to_markdown(child)
+
+        if child.name in ("strong", "b") and inner.strip():
+            parts.append(f"**{inner.strip()}**")
+        elif child.name in ("em", "i") and inner.strip():
+            parts.append(f"*{inner.strip()}*")
+        elif child.name == "a" and child.get("href"):
+            href = child["href"]
+            link_text = inner.strip()
+            if link_text and href and "MetaViewer" not in href:
+                # Skip document links (those are captured separately);
+                # keep informational links (public comment pages, etc.)
+                parts.append(f"[{link_text}]({href})")
+            elif link_text:
+                parts.append(link_text)
+        else:
+            parts.append(inner)
+
+    return "".join(parts)
+
+
+def _element_to_body(element: Tag) -> str:
+    """Convert a body-text element to markdown, cleaning up whitespace."""
+    raw = _html_to_markdown(element)
+    # Collapse runs of spaces (but not newlines)
+    text = re.sub(r"[ \t]+", " ", raw)
+    # Collapse 3+ newlines into 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# ------------------------------------------------------------------
 # Body text extraction
 # ------------------------------------------------------------------
 
@@ -271,6 +334,8 @@ def extract_body_from_table(element: Tag) -> str | None:
 
     Sacramento items live inside ``<table>`` elements with rows where
     subsequent rows after the title contain Location, Recommendation, etc.
+
+    Preserves bold labels, links, and line breaks as markdown.
     """
     table = element.find_parent("table")
     if not table:
@@ -286,7 +351,7 @@ def extract_body_from_table(element: Tag) -> str | None:
         cell = cells[-1] if cells else None
         if not cell:
             continue
-        text = cell.get_text(" ", strip=True)
+        text = _element_to_body(cell)
         if not text or len(text) < 5:
             continue
         parts.append(text)
@@ -296,7 +361,10 @@ def extract_body_from_table(element: Tag) -> str | None:
 
 
 def extract_body_after_heading(heading: Tag) -> str | None:
-    """Extract body text from ``<p>`` elements after a heading."""
+    """Extract body text from ``<p>`` elements after a heading.
+
+    Preserves emphasis, links, and line breaks as markdown.
+    """
     parts: list[str] = []
 
     for sibling in heading.next_siblings:
@@ -309,7 +377,7 @@ def extract_body_after_heading(heading: Tag) -> str | None:
         if sibling.name == "blockquote":
             break
         if sibling.name == "p":
-            text = sibling.get_text(" ", strip=True)
+            text = _element_to_body(sibling)
             if text and len(text) > 10:
                 parts.append(text)
 
@@ -318,7 +386,10 @@ def extract_body_after_heading(heading: Tag) -> str | None:
 
 
 def extract_body_after_bold(element: Tag) -> str | None:
-    """Extract body text following a bold/underline section header."""
+    """Extract body text following a bold/underline section header.
+
+    Preserves formatting as markdown.
+    """
     parts: list[str] = []
 
     for sibling in element.next_siblings:
@@ -332,12 +403,15 @@ def extract_body_after_bold(element: Tag) -> str | None:
         if sibling.name in ("table", "blockquote", "div", "strong", "h2", "h3"):
             break
         if sibling.name == "br":
+            parts.append("\n")
             continue
-        text = sibling.get_text(" ", strip=True)
+        text = _element_to_body(sibling)
         if text:
             parts.append(text)
 
     body = " ".join(parts).strip()
+    # Normalize spaces around newlines introduced by <br>
+    body = re.sub(r" *\n *", "\n", body)
     return body if body and len(body) > 10 else None
 
 
