@@ -868,6 +868,7 @@ class GranicusScraper(BaseScraper):
                 "title": title,
                 "order": str(order_num),
                 "classification": self._classify_item(title),
+                "source": "video_markers",
             }
 
             # Add video timestamp if available
@@ -915,7 +916,7 @@ class GranicusScraper(BaseScraper):
                 continue
             seen.add(title)
 
-            item: dict = {"title": title}
+            item: dict = {"title": title, "source": "agenda_page"}
             if marker.get("order"):
                 item["order"] = marker["order"]
             item["classification"] = self._classify_item(title)
@@ -941,6 +942,85 @@ class GranicusScraper(BaseScraper):
                 )
                 if docs:
                     item["documents"] = docs
+
+            items.append(item)
+
+        # Supplement: find numbered items in per-item tables that don't
+        # have Agenda-class links (e.g. Sacramento consent calendar items).
+        supplemental = self._find_numbered_table_items(soup, view_id, clip_id)
+        if supplemental:
+            existing = {it["title"] for it in items}
+            for supp in supplemental:
+                if supp["title"] not in existing:
+                    items.append(supp)
+
+        return items
+
+    def _find_numbered_table_items(
+        self, soup: BeautifulSoup, view_id: int, clip_id: int
+    ) -> list[dict]:
+        """Find numbered agenda items inside per-item ``<table>`` elements.
+
+        Sacramento consent calendar items sometimes lack ``class="Agenda"``
+        links but still appear in tables with this structure::
+
+            <table>
+              <tr>
+                <td><strong>1.</strong></td>
+                <td><strong>Item Title</strong></td>
+              </tr>
+            </table>
+
+        Each item's document links follow in the next ``<blockquote>``.
+        """
+        items: list[dict] = []
+        seen: set[str] = set()
+
+        for table in soup.find_all("table"):
+            rows = table.find_all("tr")
+            if not rows:
+                continue
+
+            first_row = rows[0]
+            cells = first_row.find_all("td")
+            if len(cells) < 2:
+                continue
+
+            # Check if the first cell has a numbered bold element
+            num_strong = cells[0].find("strong")
+            if not num_strong:
+                continue
+            num_text = num_strong.get_text(strip=True)
+            if not re.match(r"^\d+[a-z]?\.$", num_text):
+                continue
+
+            # The second cell should have the item title in bold
+            title_strong = cells[1].find("strong")
+            if not title_strong:
+                continue
+
+            # Skip if title contains an Agenda-class link (already captured)
+            if title_strong.find("a", class_=re.compile(r"\bAgenda\b")):
+                continue
+
+            title = title_strong.get_text(strip=True)
+            if not title or len(title) < 5 or title in seen:
+                continue
+            seen.add(title)
+
+            order = num_text.rstrip(".")
+
+            item: dict = {
+                "title": title,
+                "order": order,
+                "source": "agenda_page",
+                "classification": self._classify_item(title),
+            }
+
+            # Find associated documents after this table
+            docs = self._extract_documents_near(title_strong, view_id, clip_id)
+            if docs:
+                item["documents"] = docs
 
             items.append(item)
 
@@ -1070,7 +1150,7 @@ class GranicusScraper(BaseScraper):
                 continue
             seen.add(title)
 
-            item: dict = {"title": title}
+            item: dict = {"title": title, "source": "agenda_page"}
             if order_text:
                 item["order"] = order_text
             item["classification"] = self._classify_item(title)
@@ -1312,7 +1392,7 @@ class GranicusScraper(BaseScraper):
             if not title or len(title) < 3:
                 continue
 
-            item: dict = {"title": title}
+            item: dict = {"title": title, "source": "agenda_page"}
             if order:
                 item["order"] = order
             item["classification"] = self._classify_item(title)
@@ -1421,7 +1501,7 @@ class GranicusScraper(BaseScraper):
                 if not title or len(title) < 3:
                     continue
 
-                item: dict = {"title": title}
+                item: dict = {"title": title, "source": "agenda_page"}
                 if order:
                     item["order"] = order
 
@@ -1525,7 +1605,7 @@ class GranicusScraper(BaseScraper):
                 continue
             seen_titles.add(title)
 
-            item = {"title": title}
+            item = {"title": title, "source": "agenda_page"}
             if order:
                 item["order"] = order
 
@@ -1585,7 +1665,7 @@ class GranicusScraper(BaseScraper):
         if level_match:
             level = int(level_match.group(1))
 
-        item = {"title": title, "_level": level}
+        item = {"title": title, "_level": level, "source": "agenda_page"}
         if order:
             item["order"] = order
 
@@ -1744,10 +1824,53 @@ class GranicusScraper(BaseScraper):
         if duration:
             media_entry["duration_seconds"] = duration
 
+        # --- Caption / transcript URL ---
+        # Granicus delivers captions via JSON.php (not VTT files).
+        # The JSON contains {"type":"text","time":N,"text":"..."} entries.
+        caption_url = self._find_caption_url(soup, clip_id)
+        if caption_url:
+            media_entry["caption_url"] = caption_url
+
         # --- Extract index points (agenda items with timestamps) ---
         index_items = self._extract_index_points(soup, clip_id)
 
         return [media_entry], index_items
+
+    def _find_caption_url(self, soup: BeautifulSoup, clip_id: int) -> str | None:
+        """Find the caption/transcript URL for a clip.
+
+        Checks for ``<track>`` elements (VTT/SRT) first, then falls
+        back to the ``JSON.php`` endpoint which Granicus uses to deliver
+        caption data as flowplayer cuepoints.
+        """
+        # Check for standard HTML5 <track> elements (VTT/SRT)
+        for track in soup.find_all("track"):
+            src = track.get("src", "")
+            if src and any(ext in src for ext in (".vtt", ".srt", "caption")):
+                return urljoin(self.site.base_url + "/", src)
+
+        # Check for VTT/SRT URLs in script blocks
+        for script in soup.find_all("script"):
+            text = script.string or ""
+            vtt_match = re.search(
+                r'["\']?(https?://[^"\']+\.(?:vtt|srt)[^"\']*)["\']?', text
+            )
+            if vtt_match:
+                return vtt_match.group(1)
+
+        # Granicus default: captions delivered via JSON.php as cuepoint data.
+        # Check if captions are enabled for this clip.
+        captions_enabled = False
+        for script in soup.find_all("script"):
+            text = script.string or ""
+            if "captionsEnabled" in text and "true" in text.lower():
+                captions_enabled = True
+                break
+
+        if captions_enabled:
+            return self._url("JSON.php", clip_id=clip_id)
+
+        return None
 
     def _extract_index_points(
         self, soup: BeautifulSoup, clip_id: int
@@ -1772,6 +1895,7 @@ class GranicusScraper(BaseScraper):
                 "title": clean_title or title,
                 "order": order or str(order_num),
                 "classification": self._classify_item(clean_title or title),
+                "source": "video_markers",
             }
 
             # Video timestamp from the time attribute
