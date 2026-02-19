@@ -1054,6 +1054,17 @@ class GranicusScraper(BaseScraper):
                 if docs:
                     item["documents"] = docs
 
+                # Extract body text (Recommendation, Location, etc.)
+                el = marker["element"]
+                if el.name == "a":
+                    body = self._extract_body_from_table(el)
+                elif el.name in ("strong", "b"):
+                    body = self._extract_body_after_bold(el)
+                else:
+                    body = None
+                if body:
+                    item["body"] = body
+
             items.append(item)
 
         # Supplement: find numbered items in per-item tables that don't
@@ -1163,6 +1174,11 @@ class GranicusScraper(BaseScraper):
                 "level": 1,  # numbered items are sub-items (within consent section)
                 "classification": self._classify_item(title),
             }
+
+            # Extract body text (Recommendation, Location, etc.)
+            body = self._extract_body_from_table(title_strong)
+            if body:
+                item["body"] = body
 
             # Find documents between this table and the next one.
             # Each numbered item table is followed by a <blockquote>
@@ -1343,9 +1359,132 @@ class GranicusScraper(BaseScraper):
             if docs:
                 item["documents"] = docs
 
+            # Body text: look for <p> or text nodes between this heading
+            # and the next heading/blockquote (Shoreline public-comment style).
+            body = self._extract_body_after_heading(heading)
+            if body:
+                item["body"] = body
+
             items.append(item)
 
         return items
+
+    # ------------------------------------------------------------------
+    # Body text extraction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_body_from_table(element: Tag) -> str | None:
+        """Extract body text from a Sacramento-style item table.
+
+        Sacramento items live inside ``<table>`` elements with rows::
+
+            Row 1: <td><strong>N.</strong></td> <td><strong>Title</strong></td>
+            Row 2: <td></td> <td><strong>Location:</strong> text</td>
+            Row 3: <td></td> <td><strong>Recommendation:</strong> text
+                              <br><strong>Contact</strong>: text</td>
+
+        Returns the combined body text (location + recommendation +
+        contact), or ``None`` if no meaningful body is found.
+        """
+        # Walk up to the containing <table>.
+        table = element.find_parent("table")
+        if not table:
+            return None
+
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            return None
+
+        parts: list[str] = []
+
+        for row in rows[1:]:  # skip title row
+            cells = row.find_all("td")
+            # The content cell is the last one (first may be empty number col)
+            cell = cells[-1] if cells else None
+            if not cell:
+                continue
+
+            # Get the raw text, collapsing whitespace
+            text = cell.get_text(" ", strip=True)
+            if not text:
+                continue
+
+            # Skip cells that are just empty or only contain the title again
+            if len(text) < 5:
+                continue
+
+            parts.append(text)
+
+        body = "\n".join(parts).strip()
+        return body if body else None
+
+    @staticmethod
+    def _extract_body_after_heading(heading: Tag) -> str | None:
+        """Extract body text from ``<p>`` elements after a heading.
+
+        Shoreline-style pages sometimes have descriptive paragraphs
+        between headings (e.g. public comment instructions)::
+
+            <h2>PUBLIC COMMENT</h2>
+            <div>&nbsp;</div>
+            <p><em>Members of the public may sign up to...</em></p>
+
+        Returns the paragraph text, or ``None`` if none is found.
+        """
+        parts: list[str] = []
+
+        for sibling in heading.next_siblings:
+            if isinstance(sibling, str):
+                continue
+            if not isinstance(sibling, Tag):
+                continue
+            # Stop at the next heading, blockquote, or Document link region
+            if sibling.name in ("h2", "h3"):
+                break
+            if sibling.name == "blockquote":
+                break
+            if sibling.name == "p":
+                text = sibling.get_text(" ", strip=True)
+                if text and len(text) > 10:
+                    parts.append(text)
+
+        body = "\n".join(parts).strip()
+        return body if body else None
+
+    @staticmethod
+    def _extract_body_after_bold(element: Tag) -> str | None:
+        """Extract body text following a bold/underline section header.
+
+        Sacramento section headers like::
+
+            <strong><u>Consent Calendar</u></strong> <br>
+            All items listed under the Consent Calendar... <br>
+
+        The body text follows as sibling text nodes or inline elements.
+        """
+        parts: list[str] = []
+
+        for sibling in element.next_siblings:
+            if isinstance(sibling, str):
+                text = sibling.strip()
+                if text:
+                    parts.append(text)
+                continue
+            if not isinstance(sibling, Tag):
+                continue
+            # Stop at structural elements
+            if sibling.name in ("table", "blockquote", "div", "strong", "h2", "h3"):
+                break
+            if sibling.name == "br":
+                continue
+            text = sibling.get_text(" ", strip=True)
+            if text:
+                parts.append(text)
+
+        body = " ".join(parts).strip()
+        # Only return if it's meaningful (not just whitespace or tiny)
+        return body if body and len(body) > 10 else None
 
     def _extract_documents_near(
         self, element: Tag, view_id: int, clip_id: int
