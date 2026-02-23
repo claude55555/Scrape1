@@ -9,6 +9,7 @@ schema/v0.1/meeting.json        # The JSON Schema (v0.1)
 examples/                       # Sample meeting files that validate against the schema
 scrapers/
   base.py                       # Base class all scrapers inherit from
+  download.py                   # File download with extension-based filtering
   example/scraper.py            # Annotated example — copy this to start a new scraper
   granicus/                     # Granicus Classic platform scraper
     scraper.py                  #   Orchestrator (list meetings → scrape each → output)
@@ -95,6 +96,88 @@ python -m scrapers.granicus --subdomain burbank --view-id 1 --body "City Council
 python -m scrapers.granicus --all --start-date 2025-06-01 -v
 ```
 
+### Downloading files
+
+By default the scraper only records URLs. Add `--download` to fetch
+documents, captions, and transcripts to disk:
+
+```bash
+# Download with sensible defaults (PDFs, VTTs, SRTs — but not large video files)
+python -m scrapers.granicus erie --start-date 2025-01-01 --download
+
+# Only download specific types
+python -m scrapers.granicus erie --download --download-include .pdf --download-include .vtt
+
+# Download everything except video
+python -m scrapers.granicus erie --download --download-exclude .mp4 --download-exclude .m3u8
+```
+
+Downloaded files are saved under `files/` next to the JSON output, and each
+meeting record gets `local_path` fields pointing to the downloaded copies:
+
+```
+output/erie/
+├── board-of-trustees_2025-03-15_clip-6627.json
+└── files/
+    └── clip-6627/
+        ├── agenda.pdf
+        ├── minutes.pdf
+        ├── captions.vtt
+        └── staff-report-meta-12345.pdf
+```
+
+In the JSON, `local_path` appears alongside the URL on documents, media, and captions:
+
+```json
+{
+  "title": "Meeting Agenda",
+  "url": "https://erie.granicus.com/MetaViewer.php?meta_id=12345",
+  "media_type": "application/pdf",
+  "type": "agenda",
+  "local_path": "files/clip-6627/agenda.pdf"
+}
+```
+
+#### Programmatic usage
+
+Pass a `DownloadConfig` when constructing any scraper:
+
+```python
+from scrapers.download import DownloadConfig
+from scrapers.granicus.scraper import GranicusScraper, GranicusSite
+
+site = GranicusSite(
+    subdomain="erie",
+    jurisdiction_id="ocd-jurisdiction/country:us/state:co/place:erie/government",
+    jurisdiction_name="Town of Erie",
+    views={3: "Board of Trustees"},
+)
+
+# Download only PDFs and caption files
+dl = DownloadConfig(
+    enabled=True,
+    include_types={".pdf", ".vtt", ".srt"},
+)
+
+scraper = GranicusScraper(site, output_dir="output/erie", download_config=dl)
+scraper.scrape_all(start_date="2025-01-01")
+```
+
+`DownloadConfig` options:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | `bool` | `False` | Master switch — nothing is downloaded unless this is `True` |
+| `base_dir` | `Path \| None` | `None` | Override where files are saved (defaults to `{output_dir}/files/`) |
+| `include_types` | `set[str]` | `{}` | If non-empty, **only** download these extensions |
+| `exclude_types` | `set[str]` | `{}` | If non-empty, **skip** these extensions |
+
+When neither `include_types` nor `exclude_types` is set, built-in defaults apply:
+- **Included:** `.pdf`, `.vtt`, `.srt`, `.smi`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.txt`, `.rtf`, `.csv`
+- **Excluded:** `.mp4`, `.m3u8`, `.mp3`, `.wav`, `.m4a`, `.avi`, `.mov`, `.wmv`, `.flv`, `.webm`
+
+`include_types` takes precedence if both are set.
+
 **Currently configured sites:** Erie CO, Simi Valley CA, Sacramento CA, Kirkland WA, Shoreline WA.
 Add more in `scrapers/granicus/sites.py`.
 
@@ -133,8 +216,8 @@ The schema (`schema/v0.1/meeting.json`) captures:
 | `jurisdiction` | The governing municipality |
 | `agenda_items` | Ordered, nestable agenda entries with classifications |
 | `participants` | Attendees with roles and attendance |
-| `documents` | Attached PDFs — agendas, minutes, staff reports |
-| `media` | Video/audio recordings with duration |
+| `documents` | Attached PDFs — agendas, minutes, staff reports (with optional `local_path`) |
+| `media` | Video/audio recordings with duration and `captions` object (with optional `local_path`) |
 | `result` | Vote outcomes with roll-call detail |
 | `sources` | Provenance — where the data was scraped from |
 

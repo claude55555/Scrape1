@@ -8,12 +8,12 @@ pieces fit together, and how to extend it for new cities.
 Every meeting goes through this pipeline:
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌──────────┐     ┌──────────┐
-│  Discovery   │ ──> │ Agenda Parse │ ──> │  Merge   │ ──> │ Assembly │
-│ (discovery)  │     │  (parsers/)  │     │ (merge)  │     │(scraper) │
-└─────────────┘     └──────────────┘     └──────────┘     └──────────┘
-ViewPublisher.php    AgendaViewer.php      HTML items       Final JSON
-RSS feed             → auto-detect         + JSON markers   per meeting
+┌─────────────┐     ┌──────────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
+│  Discovery   │ ──> │ Agenda Parse │ ──> │  Merge   │ ──> │ Assembly │ ──> │ Download │
+│ (discovery)  │     │  (parsers/)  │     │ (merge)  │     │(scraper) │     │(optional)│
+└─────────────┘     └──────────────┘     └──────────┘     └──────────┘     └──────────┘
+ViewPublisher.php    AgendaViewer.php      HTML items       Final JSON      Fetch files,
+RSS feed             → auto-detect         + JSON markers   per meeting     add local_path
                      → pluggable parser    → fuzzy match
                                                     ↑
                                            ┌────────┴────────┐
@@ -36,6 +36,7 @@ RSS feed             → auto-detect         + JSON markers   per meeting
 | `merge.py` | ~80 | **Phase 2 glue.** Fuzzy-match HTML agenda items with video markers. Enriches HTML items with timestamps; appends unmatched markers. |
 | `sites.py` | ~80 | **Config.** `GranicusSite` entries for known cities with optional `parser_hints`. |
 | `parsers/` | ~680 | **Phase 2a.** Pluggable agenda page parsers (see below). |
+| `../download.py` | ~250 | **Post-scrape.** Optional file download with extension filtering. Scraper-agnostic (lives in `scrapers/`, not `scrapers/granicus/`). |
 
 ## The parser system
 
@@ -260,15 +261,109 @@ scraper.scrape_meeting(meeting_ref)
 │   ├── _soup(player_url)                    # Fetch player page
 │   ├── _find_video_url(soup)                # → video stream URL
 │   ├── _find_duration(soup)                 # → seconds
-│   ├── _find_caption_url(soup, clip_id)     # → captions URL
+│   ├── _find_caption_url(soup, clip_id)     # → captions {url, media_type}
 │   └── _extract_index_points(soup, clip_id) # → index_items
 │
 ├── merge_agenda_sources(agenda, index)      # Merge again if index points found
 │
 ├── scrape_minutes_link(minutes_url)         # → minutes_doc
 │
-└── assemble meeting JSON                    # → output file
+├── assemble meeting JSON                    # → meeting dict
+│
+└── save_meeting(meeting)                    # In BaseScraper:
+    │
+    ├── validate(meeting)                    # Schema check
+    ├── download_meeting_files(meeting, ...) # Optional: if DownloadConfig.enabled
+    │   │                                    # Walks documents[], media[], captions,
+    │   │                                    # agenda_items[] (recursive).
+    │   │                                    # Filters by extension, downloads,
+    │   │                                    # adds local_path to each object.
+    │   └── (skips location.url, jurisdiction.url, sources[].url)
+    └── write JSON to disk
 ```
+
+## File download system (`scrapers/download.py`)
+
+The download module is **scraper-agnostic** — it operates on any meeting dict
+conforming to the schema, not just Granicus output. It lives in `scrapers/`
+rather than `scrapers/granicus/`.
+
+### What gets downloaded
+
+The module walks these locations in the meeting dict:
+
+| Location | Typical content | Downloaded by default? |
+|---|---|---|
+| `documents[].url` | Agenda PDFs, minutes, packets | Yes |
+| `agenda_items[].documents[].url` | Staff reports, attachments (recursive into `items[]`) | Yes |
+| `media[].captions.url` | VTT/SRT caption files | Yes |
+| `media[].url` | Video/audio streams | No (large files) |
+
+These are **never** downloaded (informational links, not files):
+- `location.url` — Zoom link / venue page
+- `jurisdiction.url` — municipality homepage
+- `sources[].url` — scrape provenance
+
+### Extension filtering
+
+`DownloadConfig` supports three modes:
+
+1. **`include_types` set** — only download matching extensions (strictest)
+2. **`exclude_types` set** — download everything *except* matching extensions
+3. **Neither set** — use built-in defaults (docs/captions yes, large media no)
+
+If both are set, `include_types` takes precedence.
+
+### How it integrates
+
+```python
+# CLI: --download flag builds a DownloadConfig and passes to scraper
+scraper = GranicusScraper(site, output_dir=out, download_config=dl_config)
+
+# Programmatic: pass DownloadConfig directly
+from scrapers.download import DownloadConfig
+
+dl = DownloadConfig(enabled=True, include_types={".pdf", ".vtt"})
+scraper = GranicusScraper(site, download_config=dl)
+```
+
+`BaseScraper.save_meeting()` calls `download_meeting_files()` after validation
+but before writing the JSON, so the output file includes `local_path` fields.
+
+### File layout on disk
+
+```
+output/erie/
+├── board-of-trustees_2025-03-15_clip-6627.json
+└── files/
+    └── clip-6627/
+        ├── agenda.pdf
+        ├── minutes.pdf
+        ├── captions.vtt
+        └── staff-report-meta-12345.pdf
+```
+
+`local_path` values are relative to the JSON file's directory.
+
+### The `captions` object
+
+Media entries use a structured `captions` object instead of a bare URL string:
+
+```json
+{
+  "id": "clip-6627",
+  "url": "https://erie.granicus.com/...",
+  "type": "video",
+  "captions": {
+    "url": "https://erie.granicus.com/captions/6627.vtt",
+    "media_type": "text/vtt",
+    "local_path": "files/clip-6627/captions.vtt"
+  }
+}
+```
+
+`media.py` populates `captions.url` and `captions.media_type` during scraping.
+The download module adds `captions.local_path` if downloading is enabled.
 
 ## Design principles
 
