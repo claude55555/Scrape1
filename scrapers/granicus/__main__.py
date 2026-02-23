@@ -24,6 +24,7 @@ import argparse
 import logging
 import sys
 
+from scrapers.download import DownloadConfig
 from scrapers.granicus.scraper import GranicusScraper, GranicusSite
 from scrapers.granicus.sites import ALL_SITES
 
@@ -75,6 +76,26 @@ def main():
     parser.add_argument("-o", "--output-dir", default="output", help="Output directory (default: output).")
     parser.add_argument("--delay", type=float, default=1.0, help="Seconds between requests (default: 1.0).")
     parser.add_argument("-v", "--verbose", action="store_true")
+
+    # Download
+    parser.add_argument(
+        "--download", action="store_true",
+        help="Download referenced files (documents, captions). Large media files are excluded by default.",
+    )
+    parser.add_argument(
+        "--download-include", action="append", dest="download_include", metavar="EXT",
+        help=(
+            "Only download files with these extensions (repeatable). "
+            "Example: --download-include .pdf --download-include .vtt"
+        ),
+    )
+    parser.add_argument(
+        "--download-exclude", action="append", dest="download_exclude", metavar="EXT",
+        help=(
+            "Skip files with these extensions (repeatable). "
+            "Example: --download-exclude .mp4"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -136,15 +157,27 @@ def main():
         parser.print_help()
         sys.exit(1)
 
+    # Build download config
+    dl_config = None
+    if args.download:
+        dl_config = DownloadConfig(
+            enabled=True,
+            include_types=set(args.download_include) if args.download_include else set(),
+            exclude_types=set(args.download_exclude) if args.download_exclude else set(),
+        )
+
     total = 0
     for site in sites_to_scrape:
         out = f"{args.output_dir}/{site.subdomain}"
         print(f"\n{'='*60}")
         print(f"Scraping {site.jurisdiction_name} ({site.subdomain}.granicus.com)")
         print(f"Output:  {out}")
+        if dl_config:
+            print(f"Download: enabled")
         print(f"{'='*60}\n")
 
-        scraper = GranicusScraper(site, output_dir=out, request_delay=args.delay)
+        scraper = GranicusScraper(site, output_dir=out, request_delay=args.delay,
+                                  download_config=dl_config)
         paths = scraper.scrape_all(
             start_date=args.start_date,
             end_date=args.end_date,

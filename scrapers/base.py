@@ -7,6 +7,10 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
+
+from scrapers.download import DownloadConfig, download_meeting_files
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,9 +32,10 @@ class BaseScraper(ABC):
     jurisdiction_url: str | None = None
     source_system: str = ""  # e.g. "legistar", "granicus", "primegov"
 
-    def __init__(self, output_dir: str | Path = "output"):
+    def __init__(self, output_dir: str | Path = "output", download_config: DownloadConfig | None = None):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.download_config = download_config
         self._schema = None
 
     # --- ID helpers ---
@@ -61,13 +66,23 @@ class BaseScraper(ABC):
         return f"{slug}_{date_str}.json"
 
     def save_meeting(self, meeting: dict) -> Path:
-        """Validate and write a meeting record to the output directory."""
+        """Validate, optionally download files, and write a meeting record."""
         meeting.setdefault("schema_version", "0.1")
         meeting.setdefault("updated_at", datetime.now(timezone.utc).isoformat())
 
         errors = self.validate(meeting)
         if errors:
             logger.warning("Validation errors for %s: %s", meeting.get("id"), errors)
+
+        # Download referenced files if configured
+        if self.download_config and self.download_config.enabled:
+            session = getattr(self, "session", None) or requests.Session()
+            meeting = download_meeting_files(
+                meeting,
+                config=self.download_config,
+                session=session,
+                json_dir=self.output_dir,
+            )
 
         filename = self.output_filename(meeting)
         path = self.output_dir / filename

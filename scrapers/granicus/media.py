@@ -52,7 +52,12 @@ def scrape_media(
 
     caption_url = _find_caption_url(soup, base_url, clip_id)
     if caption_url:
-        media_entry["caption_url"] = caption_url
+        captions = {"url": caption_url}
+        if caption_url.endswith(".vtt"):
+            captions["media_type"] = "text/vtt"
+        elif caption_url.endswith(".srt"):
+            captions["media_type"] = "application/x-subrip"
+        media_entry["captions"] = captions
 
     index_items = _extract_index_points(soup, clip_id)
 

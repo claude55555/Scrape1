@@ -136,7 +136,8 @@ class GranicusScraper(BaseScraper):
 
     source_system = "granicus"
 
-    def __init__(self, site: GranicusSite, output_dir="output", request_delay=REQUEST_DELAY):
+    def __init__(self, site: GranicusSite, output_dir="output", request_delay=REQUEST_DELAY,
+                 download_config=None):
         self.site = site
         self.jurisdiction_id = site.jurisdiction_id
         self.jurisdiction_name = site.jurisdiction_name
@@ -147,7 +148,7 @@ class GranicusScraper(BaseScraper):
         # Build ordered parser list: site hints first, then remaining defaults.
         self.parsers = self._build_parser_list(site.parser_hints)
 
-        super().__init__(output_dir)
+        super().__init__(output_dir, download_config=download_config)
 
         self.session = requests.Session()
         self.session.headers.update({

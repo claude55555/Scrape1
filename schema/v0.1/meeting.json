@@ -151,6 +151,26 @@
             "type": "string",
             "description": "Human-readable label to distinguish multiple recordings.",
             "examples": ["Official YouTube recording", "Audio-only backup"]
+          },
+          "local_path": {
+            "type": "string",
+            "description": "Relative path to a locally-downloaded copy of this recording. Relative to the directory containing this JSON file. Only present when files have been downloaded."
+          },
+          "captions": {
+            "type": "object",
+            "description": "Caption/subtitle file for this recording (VTT, SRT, etc.).",
+            "properties": {
+              "url": { "type": "string", "format": "uri" },
+              "local_path": {
+                "type": "string",
+                "description": "Relative path to a locally-downloaded copy of this caption file."
+              },
+              "media_type": {
+                "type": "string",
+                "examples": ["text/vtt", "application/x-subrip"]
+              }
+            },
+            "additionalProperties": true
           }
         },
         "additionalProperties": true
@@ -444,6 +464,10 @@
           "type": "string",
           "description": "What role this document plays.",
           "examples": ["agenda", "minutes", "staff_report", "ordinance", "resolution", "attachment", "packet"]
+        },
+        "local_path": {
+          "type": "string",
+          "description": "Relative path to a locally-downloaded copy of this document. Relative to the directory containing this JSON file. Only present when files have been downloaded."
         }
       },
       "additionalProperties": true
