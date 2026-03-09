@@ -1,0 +1,116 @@
+{
+  "@context": {
+    "@version": 1.1,
+    "schema": "https://schema.org/",
+    "dcterms": "http://purl.org/dc/terms/",
+    "ocd": "https://opencivicdata.org/",
+
+    "id": "@id",
+    "@type": "schema:GovernmentEvent",
+
+    "name": "schema:name",
+    "description": "schema:description",
+    "start_date": {
+      "@id": "schema:startDate",
+      "@type": "schema:DateTime"
+    },
+    "end_date": {
+      "@id": "schema:endDate",
+      "@type": "schema:DateTime"
+    },
+    "updated_at": {
+      "@id": "dcterms:modified",
+      "@type": "schema:DateTime"
+    },
+    "status": "schema:eventStatus",
+    "license": {
+      "@id": "dcterms:license",
+      "@type": "@id"
+    },
+    "schema_version": "schema:schemaVersion",
+
+    "organization": "schema:organizer",
+    "jurisdiction": "schema:legislationJurisdiction",
+    "location": "schema:location",
+    "participants": "schema:attendee",
+    "agenda_items": "schema:subEvent",
+    "documents": "schema:associatedMedia",
+    "media": "schema:recordedIn",
+    "related_meetings": "schema:relatedEvent",
+    "sources": {
+      "@id": "dcterms:source",
+      "@container": "@set"
+    },
+
+    "Organization": {
+      "@id": "schema:Organization",
+      "@context": {
+        "name": "schema:name",
+        "classification": "schema:additionalType",
+        "url": "schema:url"
+      }
+    },
+
+    "Place": {
+      "@id": "schema:Place",
+      "@context": {
+        "name": "schema:name",
+        "address": "schema:address",
+        "url": "schema:url",
+        "coordinates": "schema:geo",
+        "latitude": "schema:latitude",
+        "longitude": "schema:longitude"
+      }
+    },
+
+    "Person": {
+      "@id": "schema:Person",
+      "@context": {
+        "name": "schema:name",
+        "role": "schema:roleName"
+      }
+    },
+
+    "Document": {
+      "@id": "schema:DigitalDocument",
+      "@context": {
+        "title": "schema:name",
+        "url": {
+          "@id": "schema:url",
+          "@type": "@id"
+        },
+        "media_type": "schema:encodingFormat",
+        "type": "schema:additionalType"
+      }
+    },
+
+    "MediaObject": {
+      "@id": "schema:MediaObject",
+      "@context": {
+        "url": {
+          "@id": "schema:contentUrl",
+          "@type": "@id"
+        },
+        "type": "schema:additionalType",
+        "media_type": "schema:encodingFormat",
+        "duration_seconds": "schema:duration",
+        "label": "schema:name",
+        "captions": "schema:caption"
+      }
+    },
+
+    "AgendaItem": {
+      "@id": "schema:Event",
+      "@context": {
+        "title": "schema:name",
+        "description": "schema:description",
+        "classification": "schema:additionalType",
+        "order": "schema:position",
+        "items": "schema:subEvent",
+        "documents": "schema:associatedMedia",
+        "speakers": "schema:performer",
+        "result": "schema:result"
+      }
+    }
+  }
+}

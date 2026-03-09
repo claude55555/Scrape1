@@ -2,10 +2,27 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schema.opencivicagenda.org/v0.1/meeting.json",
   "title": "Open Civic Agenda - Meeting",
-  "description": "A schema for municipal meeting agendas, minutes, and related records. Designed for flat-file storage, backup, migration, and interchange between systems. Uses OCD-style identifiers and Popolo-compatible field names where applicable. Files are fully self-contained — no external references need to be resolved to understand or import a record.",
+  "description": "A schema for municipal meeting agendas, minutes, and related records. Designed for flat-file storage, backup, migration, and interchange between systems. Uses OCD-style identifiers and Popolo-compatible field names where applicable. Files are fully self-contained — no external references need to be resolved to understand or import a record. Field names are mapped to schema.org (GovernmentEvent) and Dublin Core (dcterms) via an optional JSON-LD @context — include the context to enable linked-data interoperability.",
   "type": "object",
   "required": ["id", "name", "organization", "start_date"],
   "properties": {
+    "@context": {
+      "description": "JSON-LD context for standards interoperability. When included, consumers can interpret this document as linked data with fields mapped to schema.org and Dublin Core terms. Use the published context URL or inline the context object.",
+      "oneOf": [
+        {
+          "type": "string",
+          "format": "uri",
+          "examples": ["https://schema.opencivicagenda.org/v0.1/context.jsonld"]
+        },
+        { "type": "object" }
+      ]
+    },
+    "@type": {
+      "type": "string",
+      "description": "JSON-LD type. When @context is present, this declares the schema.org type for this record.",
+      "default": "GovernmentEvent",
+      "examples": ["GovernmentEvent"]
+    },
     "id": {
       "type": "string",
       "description": "Primary identifier for this meeting. OCD format recommended: ocd-event/{uuid}. See spec guidance on identifier conventions.",
@@ -216,6 +233,19 @@
         },
         "additionalProperties": true
       }
+    },
+    "description": {
+      "type": "string",
+      "description": "A brief summary of the meeting — what was covered, key decisions, or the stated purpose. Maps to schema:description and dcterms:description."
+    },
+    "license": {
+      "type": "string",
+      "description": "License or rights statement for this record. Use a SPDX identifier or URL. Maps to dcterms:license and schema:license.",
+      "examples": [
+        "https://creativecommons.org/publicdomain/zero/1.0/",
+        "CC0-1.0",
+        "https://creativecommons.org/licenses/by/4.0/"
+      ]
     },
     "extras": {
       "type": "object",

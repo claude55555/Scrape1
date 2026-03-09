@@ -1,7 +1,11 @@
 {
+  "@context": "https://schema.opencivicagenda.org/v0.1/context.jsonld",
+  "@type": "GovernmentEvent",
   "id": "ocd-event/f47ac10b-58cc-4372-a567-0e02b2c3d479",
   "name": "Regular City Council Meeting",
+  "description": "Regular meeting of the Millfield City Council covering a rezoning public hearing for a mixed-use development at 500 Oak Avenue, a resolution supporting state transportation funding, and the city manager's quarterly report.",
   "schema_version": "0.1",
+  "license": "https://creativecommons.org/publicdomain/zero/1.0/",
   "organization": {
     "id": "ocd-jurisdiction/country:us/state:co/place:millfield/government/body/city-council",
     "name": "Millfield City Council",
